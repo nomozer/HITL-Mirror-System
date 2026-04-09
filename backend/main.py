@@ -33,18 +33,38 @@ from prompt_orchestrator import PromptOrchestrator
 # ---------------------------------------------------------------------------
 
 # Lấy timeout từ .env, mặc định là 60s để đảm bảo ổn định
-HEARTBEAT_TIMEOUT_SEC = int(os.getenv("HEARTBEAT_TIMEOUT", "60"))
+HEARTBEAT_TIMEOUT_SEC = int(os.getenv("HEARTBEAT_TIMEOUT", "30"))
 last_heartbeat = time.time()
+
+
+def _kill_frontend():
+    """Tìm và tắt process đang chạy frontend (mặc định port 3000)."""
+    try:
+        if sys.platform == "win32":
+            # Windows: Tìm PID dùng port 3000
+            cmd = "netstat -ano | findstr :3000"
+            out = subprocess.check_output(cmd, shell=True).decode()
+            for line in out.strip().split("\n"):
+                if "LISTENING" in line:
+                    pid = line.strip().split()[-1]
+                    print(f"[HITL] Killing frontend process PID: {pid}")
+                    subprocess.run(f"taskkill /F /T /PID {pid}", shell=True, capture_output=True)
+        else:
+            # Linux/Mac
+            subprocess.run("fuser -k 3000/tcp", shell=True, capture_output=True)
+    except Exception as e:
+        print(f"[HITL] Could not kill frontend: {e}")
 
 
 def _monitor_heartbeat():
     """Background thread: tự động tắt backend nếu không nhận tín hiệu từ trình duyệt."""
     global last_heartbeat
     while True:
-        time.sleep(10)
+        time.sleep(5)
         elapsed = time.time() - last_heartbeat
         if elapsed > HEARTBEAT_TIMEOUT_SEC:
             print(f"[HITL] No heartbeat for {HEARTBEAT_TIMEOUT_SEC}s — shutting down.")
+            _kill_frontend()
             os._exit(0)
 
 
