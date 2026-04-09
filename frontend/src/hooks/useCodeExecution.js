@@ -62,5 +62,12 @@ export function useCodeExecution() {
     }
   }, []);
 
-  return { stdout, stderr, exitCode, isRunning, execute };
+  const reset = useCallback(() => {
+    setStdout("");
+    setStderr("");
+    setExitCode(null);
+    setIsRunning(false);
+  }, []);
+
+  return { stdout, stderr, exitCode, isRunning, execute, reset };
 }

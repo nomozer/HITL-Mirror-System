@@ -129,6 +129,31 @@ class ExecuteResponse(BaseModel):
     exit_code: int
 
 
+class FeedbackRequest(BaseModel):
+    """Structured human feedback from the HITL right panel.
+
+    action : approve | revise | reject
+    comment: free-form explanation (required for revise/reject)
+    task   : original task description (so the lesson can be retrieved later)
+    wrong_code: the code the user is reacting to (persisted as the "wrong"
+               sample if the action is revise/reject)
+    run_id : optional pointer to the pipeline run being reviewed
+    """
+
+    action: str = Field(..., description='"approve" | "revise" | "reject"')
+    comment: str = Field(default="", description="Explanation of what is wrong")
+    task: str = Field(..., min_length=1)
+    wrong_code: str = Field(default="")
+    run_id: int | None = None
+
+
+class FeedbackResponse(BaseModel):
+    action: str
+    saved: bool
+    lesson_id: int | None = None
+    message: str
+
+
 class TeachRequest(BaseModel):
     run_id: int | None = None
     task: str
@@ -185,6 +210,81 @@ async def prompt_preview(req: PromptPreviewRequest):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return bundle.to_dict()
+
+
+@app.get("/api/prompt/preview")
+async def prompt_preview_get(
+    task: str,
+    role: str = "coder",
+    code: str | None = None,
+    feedback: str | None = None,
+    lang: str = "en",
+    strategy: str = "default",
+):
+    """GET variant of prompt/preview — used by the HITL Debug panel to refresh
+    the prompt view without maintaining POST state in the URL bar.
+    """
+    try:
+        bundle = prompt_orch.build_prompt(
+            role=role,
+            task=task,
+            code=code,
+            feedback=feedback,
+            lang=lang,
+            strategy=strategy,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return bundle.to_dict()
+
+
+@app.post("/api/feedback", response_model=FeedbackResponse)
+async def feedback(req: FeedbackRequest):
+    """Ingest structured HITL feedback from the right-side review panel.
+
+    Routing rules:
+      - "approve"      → no lesson saved, just acknowledge.
+      - "revise"       → persist the comment as a lesson (score 4.0) so the
+                         next /api/generate run retrieves it via MemoryManager.
+      - "reject"       → persist as a strong negative lesson (score 2.0).
+
+    This is the bridge that turns a single human click into a durable
+    improvement for subsequent pipeline runs, making the HITL loop closed.
+    """
+    action = req.action.lower().strip()
+    if action not in {"approve", "revise", "reject"}:
+        raise HTTPException(
+            status_code=400,
+            detail='action must be one of "approve", "revise", "reject"',
+        )
+
+    if action == "approve":
+        return FeedbackResponse(
+            action=action,
+            saved=False,
+            message="Feedback acknowledged. No lesson persisted.",
+        )
+
+    if not req.comment.strip():
+        raise HTTPException(
+            status_code=400,
+            detail='"comment" is required when action is "revise" or "reject".',
+        )
+
+    score = 4.0 if action == "revise" else 2.0
+    lesson_id = prompt_orch.ingest_feedback(
+        task=req.task,
+        wrong_code=req.wrong_code,
+        correct_code="",  # no human-edited correct code from this endpoint
+        lesson_text=req.comment.strip(),
+        score=score,
+    )
+    return FeedbackResponse(
+        action=action,
+        saved=True,
+        lesson_id=lesson_id,
+        message="Lesson persisted. Next /api/generate run will retrieve it.",
+    )
 
 
 @app.post("/api/execute", response_model=ExecuteResponse)

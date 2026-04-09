@@ -121,8 +121,6 @@ class AgentOrchestrator:
 
     # ---- internal ---------------------------------------------------------
 
-    # _get_models removed as system prompts are now managed by PromptOrchestrator.
-
     async def _call_with_retry(
         self, model: genai.GenerativeModel, prompt: str
     ) -> str:

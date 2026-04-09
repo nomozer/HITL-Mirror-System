@@ -44,7 +44,7 @@ class Intent(str, Enum):
 
 
 # ---------------------------------------------------------------------------
-# Role-based system prompts (single source of truth — previously in agent.py)
+# Role-based system prompts
 # ---------------------------------------------------------------------------
 
 CODER_SYSTEM: dict[str, str] = {
@@ -142,20 +142,6 @@ def detect_intent(task: str) -> Intent:
     return Intent.GENERATION
 
 
-# ---------------------------------------------------------------------------
-# Sanitization + tag wrapping (basic prompt-injection hardening)
-# ---------------------------------------------------------------------------
-
-_TAG_OPEN = "<<<{name}>>>"
-_TAG_CLOSE = "<<<END {name}>>>"
-
-
-def _wrap(name: str, content: str) -> str:
-    """Wrap user content in visually-isolated sentinels."""
-    content = (content or "").replace("<<<", "<<")  # neutralize delimiter clashes
-    return f"{_TAG_OPEN.format(name=name)}\n{content}\n{_TAG_CLOSE.format(name=name)}"
-
-
 def _sanitize(s: Optional[str], max_len: int = 8000) -> str:
     """Neutralize role-impersonation prefixes and cap length."""
     if s is None:
@@ -173,13 +159,7 @@ def _sanitize(s: Optional[str], max_len: int = 8000) -> str:
 
 @dataclass
 class PromptBundle:
-    """Fully assembled prompt, split by component for transparency & replay.
-
-    Field usage:
-        system       -> passed to genai.GenerativeModel(system_instruction=...)
-        user_content -> passed to model.generate_content(...)
-        full         -> concatenation used for UI display / debugging only
-    """
+    """Fully assembled prompt, split by component for transparency & replay."""
 
     role: Role
     intent: Intent
@@ -213,15 +193,7 @@ class PromptBundle:
 
 
 class PromptOrchestrator:
-    """Builds structured prompts from task + code + feedback + retrieved lessons.
-
-    Responsibilities:
-        1. Decompose prompts into System / Memory / Dynamic components.
-        2. Retrieve top-k lessons from MemoryManager, re-ranked by feedback_score.
-        3. Wrap user-supplied content in sentinels to reduce prompt-injection risk.
-        4. Produce a PromptBundle consumable by the agent AND the UI inspector.
-        5. Optionally log every bundle to disk for research reproducibility.
-    """
+    """Builds structured prompts from task + code + feedback + retrieved lessons."""
 
     def __init__(
         self,
@@ -249,20 +221,7 @@ class PromptOrchestrator:
         intent: Intent | None = None,
         strategy: str = "default",
     ) -> PromptBundle:
-        """Assemble a PromptBundle for the given role and inputs.
-
-        Args:
-            role: "coder" or "critic".
-            task: Natural-language task description.
-            code: Optional current code (required for critic).
-            feedback: Optional human feedback to inject for a retry round.
-            lang: "en" or "vi".
-            intent: Override auto-detected intent.
-            strategy: Free-form tag stored in meta for A/B research comparison.
-
-        Returns:
-            A PromptBundle with system / memory / dynamic / user_content / full.
-        """
+        """Assemble a PromptBundle for the given role and inputs."""
         if isinstance(role, str):
             role = Role(role)
         lang = lang if lang in ("en", "vi") else "en"
@@ -281,8 +240,6 @@ class PromptOrchestrator:
         lessons = (
             self.memory.search_relevant_lessons(task, top_k=self.k) if task else []
         )
-        # Re-rank: prioritize high feedback_score (stable sort preserves
-        # ChromaDB semantic ordering for ties).
         lessons = sorted(
             lessons, key=lambda l: -float(l.get("feedback_score", 0.0))
         )
