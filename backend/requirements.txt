@@ -1,0 +1,12 @@
+# HITL Mirror — Python dependencies
+# Research Project: HITL Agentic Code-Learning System — "Mirror" Edition
+# NOTE: chromadb pinned to >=0.6.0 — version 0.5.23 requires building chroma-hnswlib
+# from source which needs Microsoft C++ Build Tools (not available on all Windows machines).
+
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sqlalchemy==2.0.36
+chromadb>=0.6.0
+google-generativeai==0.8.4
+python-dotenv==1.0.1
+pydantic==2.10.4
