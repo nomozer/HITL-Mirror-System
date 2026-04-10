@@ -1,9 +1,10 @@
 """
-main.py — FastAPI Backend for HITL Mirror System
-Purpose: REST API bridging the React frontend with the Agent pipeline
-         and Memory subsystem.
+main.py — FastAPI Backend for the HITL VLM Grading Agent
+Purpose: REST API bridging the React frontend with the multimodal grading
+         pipeline (Grader → Reviewer) and the Memory subsystem.
 Author: [Your Name]
-Research Project: HITL Agentic Code-Learning System — "Mirror" Edition
+Research Project: Tác tử AI hỗ trợ chấm điểm tự luận đa phương thức kết hợp
+                  phản hồi từ giáo viên (Human-in-the-loop VLM Grading Agent)
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ import asyncio
 import os
 import subprocess
 import sys
-import tempfile
 import time
 import threading
 from contextlib import asynccontextmanager
@@ -23,41 +23,40 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# FIX: uvicorn chạy từ thư mục backend/ nên import trực tiếp (không có prefix "backend.")
+# uvicorn is launched from backend/, so direct imports (no "backend." prefix).
 from agent import AgentOrchestrator
 from memory import MemoryManager
 from prompt_orchestrator import PromptOrchestrator
 
 # ---------------------------------------------------------------------------
-# Heartbeat — tự tắt server khi frontend đóng
+# Heartbeat — auto-shutdown when the frontend tab is closed
 # ---------------------------------------------------------------------------
 
-# Lấy timeout từ .env, mặc định là 60s để đảm bảo ổn định
 HEARTBEAT_TIMEOUT_SEC = int(os.getenv("HEARTBEAT_TIMEOUT", "30"))
 last_heartbeat = time.time()
 
 
 def _kill_frontend():
-    """Tìm và tắt process đang chạy frontend (mặc định port 3000)."""
+    """Find and kill the process serving the frontend (default port 3000)."""
     try:
         if sys.platform == "win32":
-            # Windows: Tìm PID dùng port 3000
             cmd = "netstat -ano | findstr :3000"
             out = subprocess.check_output(cmd, shell=True).decode()
             for line in out.strip().split("\n"):
                 if "LISTENING" in line:
                     pid = line.strip().split()[-1]
                     print(f"[HITL] Killing frontend process PID: {pid}")
-                    subprocess.run(f"taskkill /F /T /PID {pid}", shell=True, capture_output=True)
+                    subprocess.run(
+                        f"taskkill /F /T /PID {pid}", shell=True, capture_output=True
+                    )
         else:
-            # Linux/Mac
             subprocess.run("fuser -k 3000/tcp", shell=True, capture_output=True)
     except Exception as e:
         print(f"[HITL] Could not kill frontend: {e}")
 
 
 def _monitor_heartbeat():
-    """Background thread: tự động tắt backend nếu không nhận tín hiệu từ trình duyệt."""
+    """Background thread: shut the backend down if the browser stops pinging."""
     global last_heartbeat
     while True:
         time.sleep(5)
@@ -82,16 +81,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="HITL Mirror API",
+    title="HITL VLM Grading Agent API",
     lifespan=lifespan,
     version="0.1.0",
-    description="Backend for the Human-in-the-Loop Agentic Code-Learning System",
+    description="Backend for the Human-in-the-Loop multimodal essay-grading system",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    # FIX: đọc từ env var CORS_ORIGINS; mặc định localhost:3000 cho dev local.
-    # Để deploy production: set CORS_ORIGINS=https://your-domain.com trong .env
     allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),
     allow_credentials=True,
     allow_methods=["*"],
@@ -112,33 +109,44 @@ orchestrator = AgentOrchestrator(memory=memory, prompt_orchestrator=prompt_orch)
 
 
 class GenerateRequest(BaseModel):
-    task: str = Field(..., min_length=1, description="Natural-language task description")
+    """Request body for /api/generate (a.k.a. ‘grade essay’).
+
+    Field name kept for frontend backwards-compatibility, but the semantics
+    are now: ``task`` = essay topic / rubric, ``image_b64`` = the student's
+    essay image, ``wrong_code`` = the AI's previous (incorrect) grade JSON.
+    """
+
+    task: str = Field(..., min_length=1, description="Essay topic / rubric")
     lang: str = Field(default="en", description="Language code: 'en' or 'vi'")
     feedback: str | None = Field(
         default=None,
-        description="Optional human feedback injected into the coder prompt (retry round)",
+        description="Optional teacher feedback injected into the grader prompt (re-grade round)",
     )
     wrong_code: str | None = Field(
         default=None,
-        description="Previous AI-generated code that had issues — shown to the Coder so it knows exactly what to fix",
+        description="Previous AI-produced grade JSON the teacher rejected — shown to the Grader so it knows exactly what to fix",
+    )
+    image_b64: str | None = Field(
+        default=None,
+        description="Base64-encoded essay image (data URL or raw payload). Required for true multimodal grading.",
     )
     debug: bool = Field(
         default=False,
-        description="If true, include the full coder/critic PromptBundles in the response",
+        description="If true, include the full grader/reviewer PromptBundles in the response",
     )
 
 
 class GenerateResponse(BaseModel):
-    code: str
+    code: str  # Grader JSON output
     critique: dict[str, Any]
     lessons_used: list[dict[str, Any]]
     run_id: int | None
-    coder_prompt: dict[str, Any] | None = None
-    critic_prompt: dict[str, Any] | None = None
+    coder_prompt: dict[str, Any] | None = None  # Grader prompt
+    critic_prompt: dict[str, Any] | None = None  # Reviewer prompt
 
 
 class PromptPreviewRequest(BaseModel):
-    role: str = Field(..., description='"coder" or "critic"')
+    role: str = Field(..., description='"grader" or "reviewer"')
     task: str = Field(..., min_length=1)
     code: str | None = None
     feedback: str | None = None
@@ -146,25 +154,14 @@ class PromptPreviewRequest(BaseModel):
     strategy: str = Field(default="default")
 
 
-class ExecuteRequest(BaseModel):
-    code: str = Field(..., min_length=1)
-
-
-class ExecuteResponse(BaseModel):
-    stdout: str
-    stderr: str
-    exit_code: int
-
-
 class FeedbackRequest(BaseModel):
-    """Structured human feedback from the HITL right panel.
+    """Structured teacher feedback from the HITL right panel.
 
-    action : approve | revise | reject
-    comment: free-form explanation (required for revise/reject)
-    task   : original task description (so the lesson can be retrieved later)
-    wrong_code: the code the user is reacting to (persisted as the "wrong"
-               sample if the action is revise/reject)
-    run_id : optional pointer to the pipeline run being reviewed
+    action     : approve | revise | reject
+    comment    : free-form explanation (required for revise/reject)
+    task       : essay topic (so the lesson can be retrieved later)
+    wrong_code : the AI grade JSON the teacher is reacting to
+    run_id     : optional pointer to the pipeline run being reviewed
     """
 
     action: str = Field(..., description='"approve" | "revise" | "reject"')
@@ -183,10 +180,10 @@ class FeedbackResponse(BaseModel):
 
 class TeachRequest(BaseModel):
     run_id: int | None = None
-    task: str
-    wrong_code: str
-    correct_code: str
-    lesson: str
+    task: str          # essay topic
+    wrong_code: str    # AI's incorrect grade JSON
+    correct_code: str  # teacher's corrected grade JSON
+    lesson: str        # teacher's note
     score: int = Field(..., ge=1, le=5)
 
 
@@ -202,10 +199,19 @@ class TeachResponse(BaseModel):
 
 @app.post("/api/generate", response_model=GenerateResponse)
 async def generate(req: GenerateRequest):
-    """Run the Coder → Critic pipeline for a given task."""
+    """Run the VLM Grader → Reviewer pipeline for a given essay.
+
+    Despite the legacy URL ``/api/generate``, this is a multimodal grading
+    endpoint. Provide ``image_b64`` to enable true VLM grading; omit it to
+    fall back to topic-only grading.
+    """
     try:
         result = await orchestrator.run_pipeline(
-            req.task, lang=req.lang, feedback=req.feedback, wrong_code=req.wrong_code
+            req.task,
+            lang=req.lang,
+            feedback=req.feedback,
+            wrong_code=req.wrong_code,
+            image_b64=req.image_b64,
         )
         return GenerateResponse(
             code=result.code,
@@ -216,8 +222,7 @@ async def generate(req: GenerateRequest):
             critic_prompt=result.critic_prompt if req.debug else None,
         )
     except Exception as exc:
-        # Catch everything and return it as a 502 Bad Gateway to the UI
-        # This prevents generic 500 Internal Server Errors when Pydantic fails.
+        # Catch everything and return it as a 502 Bad Gateway to the UI.
         import traceback
         print(f"[API ERROR] {traceback.format_exc()}")
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -245,15 +250,13 @@ async def prompt_preview(req: PromptPreviewRequest):
 @app.get("/api/prompt/preview")
 async def prompt_preview_get(
     task: str,
-    role: str = "coder",
+    role: str = "grader",
     code: str | None = None,
     feedback: str | None = None,
     lang: str = "en",
     strategy: str = "default",
 ):
-    """GET variant of prompt/preview — used by the HITL Debug panel to refresh
-    the prompt view without maintaining POST state in the URL bar.
-    """
+    """GET variant of prompt/preview — used by the HITL Debug panel."""
     try:
         bundle = prompt_orch.build_prompt(
             role=role,
@@ -270,20 +273,18 @@ async def prompt_preview_get(
 
 @app.post("/api/feedback", response_model=FeedbackResponse)
 async def feedback(req: FeedbackRequest):
-    """Ingest structured HITL feedback from the right-side review panel.
+    """Ingest structured teacher feedback from the right-side review panel.
 
     Routing rules:
-      - "approve"      → no lesson saved, just acknowledge.
-      - "revise"       → persist as a lesson (score 4.0) — useful correction.
-      - "reject"       → persist as a lesson (score 5.0) — strongest signal,
-                         ranks first in the retrieved-lesson ordering so the
-                         Coder prompt emphasises it on the next run.
-      NOTE: PromptOrchestrator sorts retrieved lessons by feedback_score DESC
-      before injecting them into the prompt, so a HIGHER score ⇒ greater
-      influence on the next generation. Reject must therefore be the highest.
+      - "approve" → no lesson saved, just acknowledge.
+      - "revise"  → persist as a lesson (score 4.0) — useful correction.
+      - "reject"  → persist as a lesson (score 5.0) — strongest signal,
+                    ranks first in the retrieved-lesson ordering so the
+                    Grader prompt emphasises it on the next run.
 
-    This is the bridge that turns a single human click into a durable
-    improvement for subsequent pipeline runs, making the HITL loop closed.
+    NOTE: PromptOrchestrator sorts retrieved lessons by feedback_score DESC
+    before injecting them into the prompt, so a HIGHER score ⇒ greater
+    influence on the next grading round. Reject must therefore be the highest.
     """
     action = req.action.lower().strip()
     if action not in {"approve", "revise", "reject"}:
@@ -310,7 +311,7 @@ async def feedback(req: FeedbackRequest):
     lesson_id = prompt_orch.ingest_feedback(
         task=req.task,
         wrong_code=req.wrong_code,
-        correct_code="",  # no human-edited correct code from this endpoint
+        correct_code="",  # no teacher-edited corrected grade from this endpoint
         lesson_text=req.comment.strip(),
         score=score,
     )
@@ -322,41 +323,9 @@ async def feedback(req: FeedbackRequest):
     )
 
 
-@app.post("/api/execute", response_model=ExecuteResponse)
-async def execute(req: ExecuteRequest):
-    """Execute user-supplied Python code in a sandboxed subprocess."""
-    tmp_dir = Path(tempfile.gettempdir()) / "hitl_sandbox"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    tmp_file = tmp_dir / "run_code.py"
-    tmp_file.write_text(req.code, encoding="utf-8")
-
-    try:
-        proc = await asyncio.to_thread(
-            subprocess.run,
-            [sys.executable, str(tmp_file)],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        return ExecuteResponse(
-            stdout=proc.stdout,
-            stderr=proc.stderr,
-            exit_code=proc.returncode,
-        )
-    except subprocess.TimeoutExpired:
-        return ExecuteResponse(
-            stdout="",
-            stderr="Execution timed out (5 s limit).",
-            exit_code=-1,
-        )
-    finally:
-        tmp_file.unlink(missing_ok=True)
-
-
 @app.post("/api/teach", response_model=TeachResponse)
 async def teach(req: TeachRequest):
-    """Store a human-authored lesson into dual memory."""
+    """Store a teacher-authored grading lesson into dual memory."""
     lesson_id = memory.save_lesson(
         task=req.task,
         wrong_code=req.wrong_code,
@@ -380,7 +349,7 @@ async def research_stats():
 
 @app.post("/api/heartbeat")
 async def heartbeat():
-    """Reset heartbeat timer — called by frontend every 10s."""
+    """Reset heartbeat timer — called by the frontend every 10 s."""
     global last_heartbeat
     last_heartbeat = time.time()
     return {"status": "ok"}

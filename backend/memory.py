@@ -1,9 +1,17 @@
 """
 memory.py — Dual-Store Memory Manager (SQLite + ChromaDB)
-Purpose: Provides synchronized persistent storage for HITL lessons using
-         relational (SQLite) and vector (ChromaDB) backends.
+Purpose: Provides synchronized persistent storage for HITL grading lessons
+         using relational (SQLite) and vector (ChromaDB) backends.
+
+Field semantics in this project:
+    task          → essay topic
+    wrong_code    → AI's incorrect grade JSON
+    correct_code  → teacher's corrected grade JSON (optional)
+    lesson_text   → teacher's instructional note (the constraint to learn)
+
 Author: [Your Name]
-Research Project: HITL Agentic Code-Learning System — "Mirror" Edition
+Research Project: Tác tử AI hỗ trợ chấm điểm tự luận đa phương thức kết hợp
+                  phản hồi từ giáo viên (Human-in-the-loop VLM Grading Agent)
 """
 
 from __future__ import annotations
@@ -35,7 +43,10 @@ class Base(DeclarativeBase):
 
 
 class Lesson(Base):
-    """A single lesson learned from a HITL correction cycle."""
+    """A single grading lesson learned from a teacher correction cycle.
+
+    See module docstring for field-name → semantic mapping.
+    """
 
     __tablename__ = "lessons"
 
@@ -89,11 +100,16 @@ class PipelineRun(Base):
 # Memory Manager
 # ---------------------------------------------------------------------------
 
-CHROMA_COLLECTION = "hitl_lessons_v1"
+CHROMA_COLLECTION = "hitl_grading_lessons_v1"
 
 
 class MemoryManager:
-    """Dual-backend memory: SQLite for structured data, ChromaDB for semantic search."""
+    """Dual-backend memory for grading lessons.
+
+    SQLite stores the structured record (essay topic, AI grade JSON,
+    teacher grade JSON, instructional note) and ChromaDB indexes the
+    free-text lesson for semantic retrieval at prompt-build time.
+    """
 
     def __init__(self, db_dir: Path | None = None) -> None:
         if db_dir is None:
@@ -144,7 +160,14 @@ class MemoryManager:
         lesson_text: str,
         feedback_score: float = 3.0,
     ) -> int:
-        """Persist a lesson to both SQLite and ChromaDB atomically.
+        """Persist a grading lesson to both SQLite and ChromaDB atomically.
+
+        Args:
+            task:          essay topic
+            wrong_code:    AI's incorrect grade JSON (or empty)
+            correct_code:  teacher's corrected grade JSON (or empty)
+            lesson_text:   teacher's instructional note
+            feedback_score: 1.0–5.0 priority weight (higher = stronger constraint)
 
         Returns:
             The auto-generated lesson ID.

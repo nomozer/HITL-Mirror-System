@@ -1,11 +1,13 @@
 """
 prompt_orchestrator.py — Prompt Orchestration Layer
-Purpose: Modular prompt builder for the HITL pipeline. Decomposes prompts
-         into System / Memory / Dynamic components, retrieves lessons from
-         MemoryManager (SQLite + ChromaDB), and produces a PromptBundle
-         suitable for transparency, UI debugging, and research logging.
+Purpose: Modular prompt builder for the HITL VLM Grading Agent. Decomposes
+         prompts into System / Memory / Dynamic components, retrieves teacher
+         lessons from MemoryManager (SQLite + ChromaDB), and produces a
+         PromptBundle suitable for transparency, UI debugging, and research
+         logging.
 Author: [Your Name]
-Research Project: HITL Agentic Code-Learning System — "Mirror" Edition
+Research Project: Tác tử AI hỗ trợ chấm điểm tự luận đa phương thức kết hợp
+                  phản hồi từ giáo viên (Human-in-the-loop VLM Grading Agent)
 """
 
 from __future__ import annotations
@@ -31,69 +33,84 @@ logger = logging.getLogger(__name__)
 
 
 class Role(str, Enum):
-    CODER = "coder"
-    CRITIC = "critic"
+    GRADER = "grader"      # Giám khảo (VLM): đọc ảnh bài làm, chấm điểm
+    REVIEWER = "reviewer"  # Tổ trưởng kiểm định: soát lại bản chấm
 
 
 class Intent(str, Enum):
-    GENERATION = "generation"
-    BUG_FIX = "bug_fix"
-    OPTIMIZE = "optimization"
-    REFACTOR = "refactor"
-    EXPLAIN = "explain"
+    """High-level essay genre — controls grader style hints."""
+
+    ARGUMENTATIVE = "argumentative"  # Nghị luận (xã hội / văn học)
+    NARRATIVE = "narrative"          # Tự sự / kể chuyện
+    EXPOSITORY = "expository"        # Thuyết minh / giải thích
+    DESCRIPTIVE = "descriptive"      # Miêu tả
+    GENERAL = "general"              # Mặc định
 
 
 # ---------------------------------------------------------------------------
 # Role-based system prompts
 # ---------------------------------------------------------------------------
 
-CODER_SYSTEM: dict[str, str] = {
+GRADER_SYSTEM: dict[str, str] = {
     "en": (
-        "You are a Senior Python Engineer. Write concise, production-grade code. "
-        "Strictly follow PEP 8 and handle edge cases. High-priority instructions (HITL) "
-        "take precedence over general rules. Output ONLY code in ```python blocks."
+        "You are an experienced Essay Grader (VLM). Carefully read the essay image "
+        "supplied by the user (typed or handwritten). Grade on a 0–10 scale across "
+        "four rubric dimensions: Content, Argument, Expression, Creativity. "
+        "High-priority teacher constraints (HITL) override general rules. "
+        "Return ONLY a JSON object with fields: "
+        "{\"transcript\": str, \"scores\": {\"content\": float, \"argument\": float, "
+        "\"expression\": float, \"creativity\": float}, \"overall\": float, "
+        "\"strengths\": [str], \"weaknesses\": [str], \"comment\": str}."
     ),
     "vi": (
-        "Bạn là Kỹ sư Python cấp cao. Viết code súc tích, chất lượng production. "
-        "Tuân thủ PEP 8 và xử lý trường hợp biên. Các bài học bổ sung (HITL) "
-        "có ưu tiên cao nhất. CHỈ trả về code trong khối ```python."
+        "Bạn là một Giám khảo chấm bài tự luận giàu kinh nghiệm (sử dụng VLM). "
+        "Hãy đọc kỹ ảnh bài làm do người dùng cung cấp (chữ đánh máy hoặc viết tay). "
+        "Chấm theo thang điểm 0–10 cho bốn tiêu chí: Nội dung, Lập luận, Diễn đạt, "
+        "Sáng tạo. Các ràng buộc ưu tiên từ giáo viên (HITL) cao hơn quy tắc chung. "
+        "CHỈ trả về một JSON: {\"transcript\": str, \"scores\": {\"content\": số, "
+        "\"argument\": số, \"expression\": số, \"creativity\": số}, \"overall\": số, "
+        "\"strengths\": [str], \"weaknesses\": [str], \"comment\": str}."
     ),
 }
 
-CRITIC_SYSTEM: dict[str, str] = {
+REVIEWER_SYSTEM: dict[str, str] = {
     "en": (
-        "You are a strict Code Reviewer. Be brief and direct. NO introductory praise. "
-        "Limit each issue description to 15 words. Return ONLY valid JSON with fields: "
-        "'issues' (dimension, description, line), 'severity', 'suggestion'."
+        "You are a strict Grading Reviewer. Compare the Grader's JSON output with the "
+        "rubric and the essay. Be brief and direct. NO praise. Limit each issue to 15 "
+        "words. Return ONLY valid JSON: {\"issues\": [{\"dimension\": str, "
+        "\"description\": str, \"line\": int|null}], \"severity\": "
+        "\"low|medium|high\", \"suggestion\": str}."
     ),
     "vi": (
-        "Bạn là Người kiểm duyệt Code nghiêm khắc. Phản hồi cực kỳ ngắn gọn và trực tiếp. "
-        "KHÔNG khen ngợi xã giao. Giới hạn mô tả lỗi trong 15 từ. "
-        "CHỈ trả về JSON: {'issues': [...], 'severity': '...', 'suggestion': '...'}"
+        "Bạn là Tổ trưởng kiểm định nghiêm khắc. So sánh JSON chấm điểm của Giám khảo "
+        "với rubric và nội dung bài làm. Phản hồi cực kỳ ngắn gọn, KHÔNG khen xã giao. "
+        "Giới hạn mô tả lỗi trong 15 từ. CHỈ trả về JSON: {\"issues\": [{\"dimension\": "
+        "str, \"description\": str, \"line\": số|null}], \"severity\": "
+        "\"low|medium|high\", \"suggestion\": str}."
     ),
 }
 
 # Intent-specific style hints appended to the system prompt (adaptive prompting)
 INTENT_HINTS: dict[Intent, dict[str, str]] = {
-    Intent.GENERATION: {
-        "en": "Style hint: favor clarity over cleverness. Keep docstrings minimal.",
-        "vi": "Gợi ý phong cách: ưu tiên rõ ràng hơn thông minh. Docstring ngắn gọn.",
+    Intent.ARGUMENTATIVE: {
+        "en": "Style hint: weight 'Argument' highest; check thesis, evidence, refutation.",
+        "vi": "Gợi ý: trọng số cao nhất ở 'Lập luận'; kiểm tra luận điểm, dẫn chứng, phản đề.",
     },
-    Intent.BUG_FIX: {
-        "en": "Style hint: locate the root cause first, then patch. Preserve the public API.",
-        "vi": "Gợi ý phong cách: tìm nguyên nhân gốc trước khi sửa. Giữ nguyên API công khai.",
+    Intent.NARRATIVE: {
+        "en": "Style hint: weight 'Creativity' and 'Expression'; check plot arc and voice.",
+        "vi": "Gợi ý: trọng số cao ở 'Sáng tạo' và 'Diễn đạt'; kiểm tra cốt truyện và giọng văn.",
     },
-    Intent.OPTIMIZE: {
-        "en": "Style hint: explain the Big-O change in a short comment at the top.",
-        "vi": "Gợi ý phong cách: giải thích thay đổi Big-O trong một comment ngắn ở đầu.",
+    Intent.EXPOSITORY: {
+        "en": "Style hint: weight 'Content' and clarity; verify factual accuracy.",
+        "vi": "Gợi ý: trọng số cao ở 'Nội dung' và sự rõ ràng; kiểm tra tính chính xác.",
     },
-    Intent.REFACTOR: {
-        "en": "Style hint: keep behavior identical; list renames explicitly.",
-        "vi": "Gợi ý phong cách: giữ nguyên hành vi; liệt kê các tên đổi rõ ràng.",
+    Intent.DESCRIPTIVE: {
+        "en": "Style hint: weight 'Expression' and sensory detail; check imagery.",
+        "vi": "Gợi ý: trọng số cao ở 'Diễn đạt' và chi tiết giác quan; kiểm tra hình ảnh.",
     },
-    Intent.EXPLAIN: {
-        "en": "Style hint: short bullets first, then an annotated snippet.",
-        "vi": "Gợi ý phong cách: bullet ngắn trước, sau đó là snippet có chú thích.",
+    Intent.GENERAL: {
+        "en": "Style hint: balance the four rubric dimensions equally.",
+        "vi": "Gợi ý: cân bằng đều bốn tiêu chí của rubric.",
     },
 }
 
@@ -104,30 +121,30 @@ INTENT_HINTS: dict[Intent, dict[str, str]] = {
 
 _INTENT_PATTERNS: list[tuple[Intent, re.Pattern]] = [
     (
-        Intent.BUG_FIX,
+        Intent.ARGUMENTATIVE,
         re.compile(
-            r"(\bbug\b|\berror\b|\bexception\b|\btraceback\b|\bfix\b|\bbroken\b|\bfails?\b|lỗi|sửa|sai)",
+            r"(\bargue\b|\bopinion\b|\bdebate\b|\bpersuad\w*|nghị luận|bàn luận|chứng minh|thuyết phục)",
             re.IGNORECASE,
         ),
     ),
     (
-        Intent.OPTIMIZE,
+        Intent.NARRATIVE,
         re.compile(
-            r"(optimi[sz]e|faster|speed ?up|latency|memory|tối ưu|nhanh hơn|hiệu năng)",
+            r"(\bstory\b|\bnarrat\w*|\btale\b|kể chuyện|tự sự|hồi tưởng)",
             re.IGNORECASE,
         ),
     ),
     (
-        Intent.REFACTOR,
+        Intent.EXPOSITORY,
         re.compile(
-            r"(refactor|clean ?up|restructure|\brename\b|extract|tái cấu trúc|dọn dẹp)",
+            r"(\bexplain\b|\bexposit\w*|\bdefine\b|\binform\b|thuyết minh|giải thích|trình bày)",
             re.IGNORECASE,
         ),
     ),
     (
-        Intent.EXPLAIN,
+        Intent.DESCRIPTIVE,
         re.compile(
-            r"(\bexplain\b|\bwhy\b|how does|giải thích|tại sao|như thế nào)",
+            r"(\bdescribe\b|\bdescript\w*|\bportray\b|miêu tả|tả cảnh|tả người)",
             re.IGNORECASE,
         ),
     ),
@@ -135,11 +152,11 @@ _INTENT_PATTERNS: list[tuple[Intent, re.Pattern]] = [
 
 
 def detect_intent(task: str) -> Intent:
-    """Lightweight keyword-based intent detection. Defaults to GENERATION."""
+    """Lightweight keyword-based intent detection. Defaults to GENERAL."""
     for intent, pattern in _INTENT_PATTERNS:
         if pattern.search(task or ""):
             return intent
-    return Intent.GENERATION
+    return Intent.GENERAL
 
 
 def _sanitize(s: Optional[str], max_len: int = 8000) -> str:
@@ -193,7 +210,12 @@ class PromptBundle:
 
 
 class PromptOrchestrator:
-    """Builds structured prompts from task + code + feedback + retrieved lessons."""
+    """Builds structured prompts for the VLM grading pipeline.
+
+    Inputs combined: essay topic + (AI grade JSON | rubric) + teacher feedback +
+    retrieved teacher lessons. The actual essay image is supplied separately to
+    the Gemini Vision call by the AgentOrchestrator.
+    """
 
     def __init__(
         self,
@@ -221,7 +243,18 @@ class PromptOrchestrator:
         intent: Intent | None = None,
         strategy: str = "default",
     ) -> PromptBundle:
-        """Assemble a PromptBundle for the given role and inputs."""
+        """Assemble a PromptBundle for the given role and inputs.
+
+        Args:
+            role:     GRADER (initial pass) or REVIEWER (validation pass).
+            task:     The essay topic / question / rubric prompt.
+            code:     For REVIEWER, this carries the Grader's JSON output to be
+                      reviewed. (Field name kept for backward compatibility.)
+            feedback: Optional human teacher feedback to inject on a re-grade.
+            lang:     'en' or 'vi'.
+            intent:   Optional explicit essay genre — auto-detected otherwise.
+            strategy: Reserved for future grading strategies (default/strict/...).
+        """
         if isinstance(role, str):
             role = Role(role)
         lang = lang if lang in ("en", "vi") else "en"
@@ -233,7 +266,7 @@ class PromptOrchestrator:
         intent = intent or detect_intent(task)
 
         # 1. System component -------------------------------------------------
-        base_system = CODER_SYSTEM[lang] if role is Role.CODER else CRITIC_SYSTEM[lang]
+        base_system = GRADER_SYSTEM[lang] if role is Role.GRADER else REVIEWER_SYSTEM[lang]
         system = base_system + "\n\n" + INTENT_HINTS[intent][lang]
 
         # 2. Memory component -------------------------------------------------
@@ -245,12 +278,18 @@ class PromptOrchestrator:
         )
         memory_block = self._format_lessons(lessons, lang)
 
-        # 3. Dynamic component (Task/Code/Feedback) ---------------------------
-        dynamic_parts: list[str] = [f"### TASK\n{task}"]
+        # 3. Dynamic component (Topic / AI grade / Teacher feedback) ----------
+        topic_label = "ESSAY TOPIC" if lang == "en" else "ĐỀ BÀI TỰ LUẬN"
+        grade_label = "AI GRADE TO REVIEW" if lang == "en" else "BẢN CHẤM CỦA AI CẦN SOÁT"
+        feedback_label = (
+            "TEACHER FEEDBACK" if lang == "en" else "PHẢN HỒI CỦA GIÁO VIÊN"
+        )
+
+        dynamic_parts: list[str] = [f"### {topic_label}\n{task}"]
         if code:
-            dynamic_parts.append(f"### CODE TO REVIEW\n{code}")
+            dynamic_parts.append(f"### {grade_label}\n{code}")
         if feedback:
-            dynamic_parts.append(f"### ADDITIONAL FEEDBACK\n{feedback}")
+            dynamic_parts.append(f"### {feedback_label}\n{feedback}")
         dynamic = "\n\n".join(dynamic_parts)
 
         # 4. Assemble ---------------------------------------------------------
@@ -286,7 +325,14 @@ class PromptOrchestrator:
         lesson_text: str,
         score: float = 3.0,
     ) -> int:
-        """Persist a human correction as a reusable lesson via MemoryManager."""
+        """Persist a teacher correction as a reusable grading lesson.
+
+        Field semantics in this project:
+            task          → essay topic
+            wrong_code    → AI's incorrect grade JSON
+            correct_code  → teacher's corrected grade JSON (may be empty)
+            lesson_text   → teacher's instructional note
+        """
         return self.memory.save_lesson(
             task=task,
             wrong_code=wrong_code,
@@ -303,13 +349,13 @@ class PromptOrchestrator:
     ) -> str:
         if not lessons:
             return ""
-        
+
         header = (
-            "PRIORITY CONSTRAINTS (Learned from human feedback):"
+            "PRIORITY GRADING CONSTRAINTS (Learned from teacher feedback):"
             if lang == "en"
-            else "RÀNG BUỘC ƯU TIÊN (Học từ phản hồi của con người):"
+            else "RÀNG BUỘC CHẤM ĐIỂM ƯU TIÊN (Học từ phản hồi của giáo viên):"
         )
-        
+
         bullets: list[str] = []
         for les in lessons:
             text = str(les.get("lesson_text", "")).strip()

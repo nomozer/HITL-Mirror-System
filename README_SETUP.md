@@ -1,84 +1,64 @@
 # ⚙️ HITL Mirror — Hướng dẫn cài đặt kỹ thuật (Technical Setup)
 
-Tài liệu này hướng dẫn chi tiết cách thiết lập môi trường để chạy hệ thống **HITL Mirror**.
+Tài liệu này hướng dẫn chi tiết cách thiết lập môi trường để vận hành hệ thống **HITL Mirror Professional Edition**.
 
 ---
 
 ## 📋 Yêu cầu hệ thống (Prerequisites)
 
-- **Python 3.11+**: [Tải về tại đây](https://www.python.org/downloads/)
-- **Node.js 18+**: [Tải về tại đây](https://nodejs.org/)
-- **Google Gemini API Key**: [Lấy key miễn phí tại Google AI Studio](https://aistudio.google.com/apikey)
+- **Python 3.11+**: Đảm bảo đã thêm vào PATH. [Tải về](https://www.python.org/downloads/)
+- **Node.js 18+**: Cần thiết để chạy giao diện React. [Tải về](https://nodejs.org/)
+- **Google Gemini API Key**: Yêu cầu quyền truy cập mô hình Vision (1.5 Flash hoặc 1.5 Pro). [Lấy key miễn phí](https://aistudio.google.com/apikey)
 
 ---
 
-## ⚡ 1. Cách chạy nhanh (Khuyên dùng)
+## ⚡ 1. Khởi chạy nhanh (Recommended)
 
-Nếu bạn đã cài đặt Python và Node.js, bạn chỉ cần thực hiện 2 bước sau:
+Hệ thống được thiết kế để tự động hóa tối đa quy trình cài đặt.
 
-1.  Mở file `backend/.env` và thay đổi `GOOGLE_API_KEY` của bạn.
-2.  Chạy file `start_hidden.bat` ở thư mục gốc.
+1.  **Cấu hình API:** Sao chép file `backend/.env.example` thành `backend/.env` (nếu có) hoặc chỉnh sửa trực tiếp `backend/.env`. Điền Key của bạn vào:
+    `GOOGLE_API_KEY=your_key_here`
+2.  **Kích hoạt:** Chạy file `start_hidden.bat` tại thư mục gốc.
 
-*Hệ thống sẽ tự động cài đặt các thư viện cần thiết lần đầu tiên và khởi chạy cả Backend & Frontend.*
-
----
-
-## 🛠️ 2. Thiết lập thủ công (Từng bước)
-
-Nếu bạn muốn kiểm soát từng bước hoặc gặp lỗi khi chạy script, hãy làm theo hướng dẫn này:
-
-### Bước 2.1: Cấu hình Backend
-1. Mở terminal tại thư mục `backend/`.
-2. Tạo môi trường ảo: `python -m venv venv`.
-3. Kích hoạt môi trường: `venv\Scripts\activate`.
-4. Cài đặt thư viện: `pip install -r requirements.txt`.
-5. Sau khi cấu hình `.env`, chạy server: `uvicorn main:app --reload --port 8000`.
-
-### Bước 2.2: Cấu hình Frontend
-1. Mở một terminal mới tại thư mục `frontend/`.
-2. Cài đặt dependencies: `npm install`.
-3. Chạy ứng dụng: `npm start`.
+*Hệ thống sẽ tự động tạo Virtual Environment cho Python, cài đặt thư viện cho cả Backend & Frontend, sau đó mở trình duyệt tại `http://localhost:3000`.*
 
 ---
 
-## 🔐 3. Cấu hình biến môi trường (.env)
+## 🛠️ 2. Thiết lập thủ công (Manual Setup)
 
-Vị trí: `backend/.env`
+Dành cho các nhà phát triển muốn can thiệp sâu hoặc gỡ lỗi:
 
-```ini
-# Google Gemini API Key (Bắt buộc)
-GOOGLE_API_KEY=your_gemini_api_key_here
+### Bước 2.1: Backend (FastAPI)
+- `cd backend`
+- `python -m venv venv`
+- `.\venv\Scripts\activate` (Windows)
+- `pip install -r requirements.txt`
+- `uvicorn main:app --reload --port 8000`
 
-# Model Configuration
-GEMINI_MODEL=gemini-2.5-flash
-
-# CORS Settings (Mặc định cho local dev)
-CORS_ORIGINS=http://localhost:3000
-```
+### Bước 2.2: Frontend (React)
+- `cd frontend`
+- `npm install`
+- `npm start`
 
 ---
 
-## 🔍 4. Xử lý sự cố (Troubleshooting)
+## 🔍 3. Xử lý sự cố (Troubleshooting)
 
-- **Lỗi cổng 8000 hoặc 3000 đã bị sử dụng:**
-  Đôi khi server cũ không tắt hoàn toàn, bạn có thể chạy lệnh này trong PowerShell để giải phóng cổng:
+- **Lỗi Multimodal (Ảnh/PDF):** Đảm bảo API Key của bạn hỗ trợ mô hình Gemini 1.5. Nếu tệp PDF quá lớn, hãy thử giảm số trang hoặc dung lượng.
+- **Lỗi cổng (Port Conflict):** Nếu port 8000 hoặc 3000 bị chiếm dụng, hãy chạy lệnh sau trong PowerShell để giải phóng:
   ```powershell
   Get-NetTCPConnection -LocalPort 8000,3000 | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
   ```
-
-- **Không nhận diện được Gemini API Key:**
-  Hãy đảm bảo bạn không có dấu cách thừa trong file `.env` và đã lưu file.
-
-- **Frontend không hiển thị dữ liệu:**
-  Kiểm tra terminal backend xem có thông báo lỗi `404` hay không. Đảm bảo Backend đang chạy tại port `8000`.
+- **Lỗi Vite/NPM:** Nếu Frontend không khởi động, hãy xóa thư mục `node_modules` và chạy lại `npm install`.
 
 ---
 
-## 🛑 5. Cách dừng hệ thống
+## 🛑 4. Cơ chế Quản lý Tài nguyên (Heartbeat)
 
-Hệ thống tích hợp sẵn cơ chế **Heartbeat**:
-- Chỉ cần đóng trình duyệt.
-- Backend sẽ tự động tắt sau **60 giây** để giải phóng RAM và CPU.
+Để tiết kiệm RAM/CPU và chi phí API, hệ thống tích hợp sẵn cơ chế **Tự động tắt**:
+- Backend sẽ lắng nghe tín hiệu từ Frontend (Heartbeat) mỗi 30 giây.
+- **Khi đóng tab trình duyệt:** Backend sẽ tự động phát hiện và kết thúc toàn bộ tiến trình sau **30-60 giây**.
+- Bạn không cần phải thủ công tắt cửa sổ Terminal.
 
 ---
-*Nếu gặp bất kỳ khó khăn nào, hãy kiểm tra logs trong cửa sổ terminal.*
+*Tài liệu hướng dẫn vận hành kỹ thuật — Đội ngũ phát triển Antigravity.*

@@ -1,14 +1,18 @@
 """
-agent.py — Dual-Persona Gemini Engine (Coder + Critic)
-Purpose: Orchestrates two Gemini model instances with distinct system
-         instructions to simulate an AI self-critique loop.
+agent.py — Dual-Persona Gemini Vision Engine (Grader + Reviewer)
+Purpose: Orchestrates two Gemini VLM instances with distinct system
+         instructions to grade essays from images and self-critique the
+         resulting grade.
 Author: [Your Name]
-Research Project: HITL Agentic Code-Learning System — "Mirror" Edition
+Research Project: Tác tử AI hỗ trợ chấm điểm tự luận đa phương thức kết hợp
+                  phản hồi từ giáo viên (Human-in-the-loop VLM Grading Agent)
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
@@ -33,22 +37,27 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PipelineResult:
-    """Immutable output of a single pipeline run."""
+    """Immutable output of a single grading pipeline run.
 
-    code: str
+    The historical field name `code` now carries the Grader's JSON output
+    (transcript + scores + comment). Kept as `code` for frontend compat.
+    """
+
+    code: str  # Grader JSON (essay grade)
     critique: dict[str, Any]
     lessons_used: list[dict[str, Any]] = field(default_factory=list)
     run_id: int | None = None
     # Transparency: the fully-assembled prompt bundles for UI inspector / research
-    coder_prompt: dict[str, Any] | None = None
-    critic_prompt: dict[str, Any] | None = None
+    coder_prompt: dict[str, Any] | None = None  # Grader prompt
+    critic_prompt: dict[str, Any] | None = None  # Reviewer prompt
 
 
 # ---------------------------------------------------------------------------
 # Agent wrappers
 # ---------------------------------------------------------------------------
 
-# Ordered by quality — auto-rotation falls through this list when quota is hit
+# Ordered by quality — auto-rotation falls through this list when quota is hit.
+# All listed models support multimodal (image) inputs via Gemini Vision.
 CANDIDATE_MODELS: list[str] = [
     "gemini-2.5-flash",
     "gemini-2.0-flash",
@@ -84,21 +93,62 @@ def _create_model(system_instruction: str, model_name: str) -> genai.GenerativeM
     )
 
 
-def _extract_code_block(text: str) -> str:
-    """Pull the first ```python ... ``` block out of model output."""
-    match = re.search(r"```python\s*\n(.*?)```", text, re.DOTALL)
-    return match.group(1).strip() if match else text.strip()
+def _decode_image(image_b64: str | None) -> dict[str, Any] | None:
+    """Decode a base64-encoded essay file into a Gemini inline data part.
+
+    Accepts either a raw base64 payload or a data URL
+    (e.g. ``data:image/png;base64,XXXX`` or ``data:application/pdf;base64,XXXX``).
+    Supports images (PNG, JPEG, etc.) and PDF files — Gemini handles both natively.
+    Returns None when no file is given.
+    """
+    if not image_b64:
+        return None
+    payload = image_b64.strip()
+    mime = "image/png"
+    if payload.startswith("data:"):
+        try:
+            header, payload = payload.split(",", 1)
+            mime = header.split(";")[0].removeprefix("data:") or mime
+        except ValueError:
+            pass
+    try:
+        raw = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"Invalid base64 essay image: {exc}") from exc
+    return {"mime_type": mime, "data": raw}
 
 
-def _parse_critique_json(text: str) -> dict[str, Any]:
-    """Best-effort extraction of JSON from critic response."""
-    # Strip markdown fences if present
+def _parse_grade_json(text: str) -> dict[str, Any]:
+    """Best-effort extraction of a Grader JSON object from VLM output."""
     cleaned = re.sub(r"```(?:json)?\s*\n?", "", text).strip()
     cleaned = cleaned.rstrip("`").strip()
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        # Fallback: try to find first { ... } blob
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+        # Fallback envelope so the UI can still render an error state.
+        return {
+            "transcript": "",
+            "scores": {"content": 0, "argument": 0, "expression": 0, "creativity": 0},
+            "overall": 0,
+            "strengths": [],
+            "weaknesses": ["Unparseable grader output"],
+            "comment": cleaned[:400],
+        }
+
+
+def _parse_review_json(text: str) -> dict[str, Any]:
+    """Best-effort extraction of the Reviewer's JSON critique."""
+    cleaned = re.sub(r"```(?:json)?\s*\n?", "", text).strip()
+    cleaned = cleaned.rstrip("`").strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
         match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if match:
             try:
@@ -106,9 +156,11 @@ def _parse_critique_json(text: str) -> dict[str, Any]:
             except json.JSONDecodeError:
                 pass
         return {
-            "issues": [{"dimension": "Parse Error", "description": cleaned, "line": None}],
+            "issues": [
+                {"dimension": "Parse Error", "description": cleaned, "line": None}
+            ],
             "severity": "medium",
-            "suggestion": "Could not parse critic output — review manually.",
+            "suggestion": "Could not parse reviewer output — review manually.",
         }
 
 
@@ -125,7 +177,6 @@ def _parse_retry_delay(err_str: str) -> float | None:
     match = re.search(r"retry(?:_delay)?.*?(\d+(?:\.\d+)?)\s*s", err_str, re.IGNORECASE)
     if match:
         return float(match.group(1))
-    # Fallback: look for "retry in Xs" pattern
     match = re.search(r"retry\s+in\s+(\d+(?:\.\d+)?)", err_str, re.IGNORECASE)
     if match:
         return float(match.group(1))
@@ -133,7 +184,7 @@ def _parse_retry_delay(err_str: str) -> float | None:
 
 
 class AgentOrchestrator:
-    """Runs the Coder → Critic pipeline with retry & memory integration.
+    """Runs the VLM Grader → Reviewer pipeline with retry & memory integration.
 
     Prompt assembly is delegated to PromptOrchestrator (injection-safe
     system/memory/dynamic decomposition + research logging).
@@ -169,22 +220,28 @@ class AgentOrchestrator:
         )
         self._model_idx = next_idx
 
-    async def _call_with_retry(self, system_instruction: str, prompt: str) -> str:
-        """Call Gemini with auto model-rotation on quota errors.
+    async def _call_with_retry(
+        self,
+        system_instruction: str,
+        prompt: str,
+        image_part: dict[str, Any] | None = None,
+    ) -> str:
+        """Call Gemini Vision with auto model-rotation on quota errors.
 
-        Two types of 429 are handled differently:
-        - Per-day quota ("PerDay" in error): rotate immediately, no sleep —
-          waiting does nothing since the quota won't reset for hours.
-        - Per-minute rate limit (has a retry_delay suggestion): wait the
-          suggested delay, then retry the NEW model.
+        When ``image_part`` is supplied, the call is multimodal — the essay
+        image is sent alongside the textual prompt so the VLM can read both
+        printed and handwritten student work.
         """
         last_exc: Exception | None = None
         for attempt in range(1, MAX_RETRIES + 1):
             model = _create_model(system_instruction, self._current_model_name())
             try:
                 timeout_secs = int(os.getenv("GEMINI_TIMEOUT", "60"))
+                payload: list[Any] = [prompt]
+                if image_part is not None:
+                    payload.insert(0, image_part)
                 response = await asyncio.wait_for(
-                    asyncio.to_thread(model.generate_content, prompt),
+                    asyncio.to_thread(model.generate_content, payload),
                     timeout=timeout_secs,
                 )
                 if not response.candidates:
@@ -210,14 +267,12 @@ class AgentOrchestrator:
                     raise
 
                 if is_daily_quota:
-                    # No point sleeping — rotate was already done, retry immediately
                     logger.warning(
                         "[HITL] Daily quota exhausted — switching to %s (attempt %d/%d)",
                         self._current_model_name(), attempt, MAX_RETRIES,
                     )
                     continue
 
-                # Per-minute rate limit or transient error: wait then retry
                 api_delay = _parse_retry_delay(err_str)
                 delay = (api_delay if api_delay else RETRY_BASE_DELAY * attempt) + 3
                 logger.warning(
@@ -239,80 +294,88 @@ class AgentOrchestrator:
         lang: str = "en",
         feedback: str | None = None,
         wrong_code: str | None = None,
+        image_b64: str | None = None,
     ) -> PipelineResult:
-        """Execute the full Coder → Critic pipeline.
+        """Execute the full VLM Grader → Reviewer pipeline.
 
         Args:
-            task: Natural-language task description.
-            lang: Language code ('en' or 'vi') for prompts and critique output.
-            feedback: Optional human feedback to inject on a retry round.
+            task:       Essay topic / question / rubric description.
+            lang:       Language code ('en' or 'vi').
+            feedback:   Optional teacher feedback to inject on a re-grade.
+            wrong_code: AI's previous (incorrect) grade JSON, shown to the
+                        Grader so it can self-correct.
+            image_b64:  Base64-encoded essay image (PNG/JPEG). Optional —
+                        if omitted, the Grader works from the topic alone.
 
         Steps:
-            1. Build coder PromptBundle (system + lessons + task [+ feedback]).
-            2. Create Gemini Coder model with bundle.system; generate code.
-            3. Wait 2 s (Gemini rate-limit courtesy).
-            4. Build critic PromptBundle (system + lessons + task + code).
-            5. Create Gemini Critic model with bundle.system; parse JSON critique.
+            1. Build Grader PromptBundle (system + lessons + topic [+ feedback]).
+            2. Call Gemini VLM with the essay image to produce a grade JSON.
+            3. Wait 2 s (rate-limit courtesy).
+            4. Build Reviewer PromptBundle (system + lessons + topic + grade).
+            5. Call Gemini Reviewer; parse JSON critique.
             6. Log the pipeline run to SQLite.
-
-        Returns:
-            PipelineResult with code, critique, lessons_used, run_id, and the
-            two PromptBundles (as dicts) for UI transparency and research.
         """
         # 0 — Re-read .env to pick up any API key / model changes
         _configure_genai()
 
-        # 1 — Merge wrong_code into feedback so the Coder sees exactly what
-        #     it wrote before and what the human found wrong with it.
-        #     This is the core of the HITL revision loop: without wrong_code,
-        #     the model would only have the human comment ("lacks error handling")
-        #     but not the actual code to fix.
+        # Decode the essay image once; reused by both Grader and Reviewer.
+        image_part = _decode_image(image_b64)
+
+        # 1 — Merge wrong_code into feedback so the Grader sees exactly what
+        #     it produced before and what the teacher found wrong with it.
         effective_feedback = feedback
         if wrong_code and wrong_code.strip():
-            wrong_section = f"Previous attempt (has issues):\n```python\n{wrong_code.strip()}\n```"
+            wrong_section = (
+                f"Previous AI grade (had issues):\n```json\n{wrong_code.strip()}\n```"
+            )
             effective_feedback = (
-                f"{wrong_section}\n\nHuman correction: {feedback}"
+                f"{wrong_section}\n\nTeacher correction: {feedback}"
                 if feedback else wrong_section
             )
 
-        coder_bundle = self.prompts.build_prompt(
-            role=Role.CODER,
+        grader_bundle = self.prompts.build_prompt(
+            role=Role.GRADER,
             task=task,
             feedback=effective_feedback,
             lang=lang,
         )
 
-        # 2 — Call Coder (model chosen automatically or from GEMINI_MODEL env)
-        raw_code = await self._call_with_retry(coder_bundle.system, coder_bundle.user_content)
-        code = _extract_code_block(raw_code)
+        # 2 — Call Grader VLM (multimodal: text prompt + essay image)
+        raw_grade = await self._call_with_retry(
+            grader_bundle.system, grader_bundle.user_content, image_part=image_part
+        )
+        grade_json = _parse_grade_json(raw_grade)
+        grade_str = json.dumps(grade_json, ensure_ascii=False, indent=2)
 
         # 3 — Rate-limit gap
         await asyncio.sleep(2)
 
-        # 4 — Build critic prompt (with generated code attached)
-        critic_bundle = self.prompts.build_prompt(
-            role=Role.CRITIC,
+        # 4 — Build Reviewer prompt (with grader output attached as `code`)
+        reviewer_bundle = self.prompts.build_prompt(
+            role=Role.REVIEWER,
             task=task,
-            code=code,
+            code=grade_str,
             lang=lang,
         )
 
-        # 5 — Call Critic with same active model
-        raw_critique = await self._call_with_retry(critic_bundle.system, critic_bundle.user_content)
-        critique = _parse_critique_json(raw_critique)
+        # 5 — Call Reviewer (also multimodal so it can verify against the image)
+        raw_review = await self._call_with_retry(
+            reviewer_bundle.system, reviewer_bundle.user_content, image_part=image_part
+        )
+        critique = _parse_review_json(raw_review)
 
         # 6 — Log pipeline run
-        # Gemini sometimes returns "Low"/"LOW" — normalise before comparing
+        # "low" severity ⇒ no manual intervention needed (auto-accepted grade).
         auto_fixed = str(critique.get("severity", "")).strip().lower() == "low"
         run_id = self.memory.log_pipeline_run(
             task=task, iterations=1, auto_fixed=auto_fixed
         )
 
         return PipelineResult(
-            code=code,
+            code=grade_str,
             critique=critique,
-            lessons_used=coder_bundle.lessons_used,
+            lessons_used=grader_bundle.lessons_used,
             run_id=run_id,
-            coder_prompt=coder_bundle.to_dict(),
-            critic_prompt=critic_bundle.to_dict(),
+            coder_prompt=grader_bundle.to_dict(),
+            critic_prompt=reviewer_bundle.to_dict(),
         )

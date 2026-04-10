@@ -1,7 +1,8 @@
-// useFeedback.js — Hook for the HITL right-panel feedback loop.
-// POSTs structured feedback to /api/feedback so the backend persists the
-// comment as a lesson (for revise/reject). The returned lesson_id lets the
-// UI show "✅ New lesson added" before kicking off a rerun of /api/generate.
+// useFeedback.js — Hook for the HITL teacher-feedback loop.
+// POSTs structured feedback (approve/revise/reject + comment) to /api/feedback
+// so the backend persists the teacher's correction as a grading lesson. The
+// returned lesson_id lets the UI show "✅ New lesson added" before kicking off
+// a re-grade via /api/generate.
 
 import { useState, useCallback } from "react";
 

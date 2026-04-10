@@ -1,5 +1,5 @@
-// useAgentPipeline.js — Hook điều khiển Coder→Critic pipeline.
-// Quản lý phase transitions và kết quả generate qua useReducer.
+// useAgentPipeline.js — Hook điều khiển Grader→Reviewer (VLM) pipeline.
+// Quản lý phase transitions và kết quả grading qua useReducer.
 
 import { useReducer, useCallback } from "react";
 
@@ -86,23 +86,29 @@ function reducer(state, action) {
 // ── Hook ────────────────────────────────────────────────────────────
 
 /**
- * Hook quản lý Coder→Critic pipeline.
+ * Hook quản lý Grader→Reviewer (VLM) pipeline.
  *
  * @returns {{
  *   phase: 'idle'|'generating'|'reviewing'|'done',
- *   code: string|null,
+ *   code: string|null,                               // Grader JSON output
  *   critique: {issues: Array, severity: string, suggestion: string}|null,
  *   lessonsUsed: Array,
  *   runId: number|null,
  *   error: string|null,
- *   generate: (task: string) => Promise<void>,
+ *   generate: (task, lang, feedback, wrongCode, imageB64) => Promise<void>,
  *   reset: () => void
  * }}
  */
 export function useAgentPipeline() {
   const [state, dispatch] = useReducer(reducer, initialState);
 
-  const generate = useCallback(async (task, lang = "en", feedback = null, wrongCode = null) => {
+  const generate = useCallback(async (
+    task,
+    lang = "en",
+    feedback = null,
+    wrongCode = null,
+    imageB64 = null,
+  ) => {
     dispatch({ type: ACTIONS.PIPELINE_START });
 
     const controller = new AbortController();
@@ -116,7 +122,14 @@ export function useAgentPipeline() {
       const res = await fetch(`${API_BASE}/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ task, lang, feedback, wrong_code: wrongCode, debug: true }),
+        body: JSON.stringify({
+          task,
+          lang,
+          feedback,
+          wrong_code: wrongCode,
+          image_b64: imageB64,
+          debug: true,
+        }),
         signal: controller.signal,
       });
 

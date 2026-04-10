@@ -1,5 +1,7 @@
-// useTeachMemory.js — Hook lưu lesson + lấy stats từ memory.
+// useTeachMemory.js — Hook lưu bài học chấm điểm + lấy stats từ memory.
 // Hai action: teach (POST /api/teach) và fetchStats (GET /api/research/stats).
+// Trong dự án này: wrongCode = bản chấm sai của AI, correctCode = bản chấm
+// đúng do giáo viên sửa, lesson = ghi chú sư phạm để áp vào lần chấm sau.
 
 import { useState, useCallback } from "react";
 
