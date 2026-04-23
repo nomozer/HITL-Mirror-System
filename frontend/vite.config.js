@@ -10,9 +10,8 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:8000',
         changeOrigin: true,
-        // Don't spam stderr / browser console when the backend is briefly
-        // unreachable (e.g. during uvicorn's auto-reload).  Heartbeat and
-        // other polling requests can safely retry on the next tick.
+        timeout: 300000,         // Wait 5 minutes for the AI to respond
+        proxyTimeout: 300000,    // Wait 5 minutes for the proxy itself
         configure: (proxy) => {
           proxy.on('error', (err, req, res) => {
             if (res && !res.headersSent) {
