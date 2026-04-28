@@ -2,8 +2,8 @@
 prompts/math.py — Toán-specific prompt content.
 
 Provides Rule 8 (calibration examples) + Rule 9 (algebra crosscheck) for
-Math grading. The rest of the prompt (Rules 1–7, 9b anchors, 10 preflight,
-persona, rubric) is shared via ``prompts.base``.
+Math grading. The rest of the prompt (Rules 1–7, 9b anchors, persona,
+rubric) is shared via ``prompts.base``.
 
 Upgrade tips:
   - When you see recurring teacher corrections on Math, add a new example

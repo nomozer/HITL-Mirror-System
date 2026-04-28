@@ -393,7 +393,10 @@ export function StepUpload({
         )}
       </div>
 
-      {/* Submit */}
+      {/* Submit — disabled state intentionally uses bgMuted (not bgCard) so it
+          stays visible against the surrounding card surface. With bgCard the
+          button border + fill matched the page background and the control
+          effectively disappeared until the teacher uploaded both files. */}
       <button
         onClick={onSubmit}
         disabled={!canSubmit}
@@ -401,10 +404,13 @@ export function StepUpload({
           width: "100%",
           padding: "14px 24px",
           fontSize: 17,
+          fontWeight: 600,
           color: canSubmit ? T.bgCard : T.textMute,
-          background: canSubmit ? T.accent : T.bgCard,
+          background: canSubmit ? T.accent : T.bgMuted,
           border: `1px solid ${canSubmit ? T.accent : T.border}`,
           borderRadius: 6,
+          cursor: canSubmit ? "pointer" : "not-allowed",
+          opacity: canSubmit ? 1 : 0.85,
           transition: "all 0.2s",
         }}
       >

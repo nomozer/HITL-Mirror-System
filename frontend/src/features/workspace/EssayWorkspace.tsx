@@ -265,14 +265,14 @@ export function EssayWorkspace({
   // first-time session; localStorage persists it for return visits.
   if (!selectedSubject) {
     return (
-      <div style={{ padding: "0 32px 40px", display: active ? "block" : "none" }}>
+      <div style={{ padding: "0 32px 96px", display: active ? "block" : "none" }}>
         <WaitingForSubjectHero />
       </div>
     );
   }
 
   return (
-    <div style={{ padding: "0 32px 40px", display: active ? "block" : "none" }}>
+    <div style={{ padding: "0 32px 96px", display: active ? "block" : "none" }}>
       <StepIndicator steps={stepLabels} currentStep={displayStep} />
 
       {pipeline.error && (

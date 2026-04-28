@@ -501,6 +501,13 @@ interface QuestionBoxProps {
   isAnalyzing: boolean;
   t: I18nStrings;
   subject: Subject | string;
+  /**
+   * Whether the parent grade envelope was flagged as salvaged. Gates the
+   * empty-AI-comment placeholder: when salvaged, the absence of a comment
+   * means Gemini stopped early — show an amber warning instead of the green
+   * "no issues" badge that would falsely imply approval.
+   */
+  isSalvaged: boolean;
 }
 
 function QuestionBox({
@@ -513,6 +520,7 @@ function QuestionBox({
   isAnalyzing,
   t,
   subject,
+  isSalvaged,
 }: QuestionBoxProps) {
   const [expanded, setExpanded] = useState(true);
 
@@ -659,6 +667,29 @@ function QuestionBox({
               marginBottom: 10,
             }}
           />
+        ) : isSalvaged ? (
+          <div
+            style={{
+              padding: "8px 12px",
+              borderRadius: 8,
+              background: T.amberSoft,
+              borderLeft: `3px solid ${T.amber}`,
+              fontSize: 14,
+              color: T.textSoft,
+              lineHeight: 1.5,
+              marginBottom: 10,
+            }}
+          >
+            <Icon.AlertTriangle
+              size={12}
+              color={T.amber}
+              style={{ marginRight: 6, verticalAlign: "middle" }}
+            />
+            {String(
+              t.noCommentSalvaged ??
+                "Phản hồi cho câu này bị cắt — hãy đối chiếu bài làm hoặc chấm lại.",
+            )}
+          </div>
         ) : (
           <div
             style={{
@@ -1024,13 +1055,17 @@ export function StepReview({
           minHeight: 28,
         }}
       >
+        {/* Left side intentionally empty — both meta-controls (lightbulb +
+            view-original) cluster on the right per design 2026-04-26. The
+            empty div keeps justifyContent: "space-between" pushing the
+            right cluster to the edge without restructuring the flex parent. */}
+        <div />
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           {stagedLessons.length > 0 && (
-            // Lightbulb-with-counter: a compact replacement for the old
-            // "X bài học đang chờ lưu" pill. ``key`` is set to the count so
-            // React remounts the wrapper on every increment, replaying the
-            // ``lessonPop`` keyframe — gives the teacher a quick visual cue
-            // that a new lesson was just staged from their last comment.
+            // Lightbulb-with-counter: ``key`` set to the count so React
+            // remounts the wrapper on every increment, replaying the
+            // ``lessonPop`` keyframe — gives the teacher a quick visual
+            // cue that a new lesson was just staged from their last comment.
             <span
               key={stagedLessons.length}
               title={`${stagedLessons.length} ${
@@ -1075,8 +1110,6 @@ export function StepReview({
               </span>
             </span>
           )}
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           {essayImage?.dataUrl && (
             <button
               onClick={() => setShowOriginal(true)}
@@ -1227,6 +1260,7 @@ export function StepReview({
             isAnalyzing={analyzingQ === i}
             t={t}
             subject={subject}
+            isSalvaged={isSalvaged}
           />
         ))
       )}

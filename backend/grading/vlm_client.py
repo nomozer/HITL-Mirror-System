@@ -119,7 +119,7 @@ def _create_model(
     model_name: str,
     *,
     json_mode: bool = False,
-    max_output_tokens: int = 16384,
+    max_output_tokens: int = 32768,
 ) -> genai.GenerativeModel:
     """Build a Gemini model with our standard generation config.
 
@@ -193,7 +193,7 @@ class GeminiClient:
         task_pdf_part: dict[str, Any] | None = None,
         *,
         json_mode: bool = False,
-        max_output_tokens: int = 16384,
+        max_output_tokens: int = 32768,
     ) -> str:
         """Call Gemini with auto model-rotation on quota errors.
 

@@ -58,8 +58,13 @@ export async function apiPost<TReq, TRes>(
  * Fire-and-forget POST — swallows all errors. Used only for the
  * heartbeat where a missed ping is not a user-facing concern.
  */
-export function apiPostQuiet(path: string): Promise<void> {
-  return fetch(`${API_BASE}${path}`, { method: "POST" })
+export function apiPostQuiet(path: string, body?: any): Promise<void> {
+  const init: RequestInit = { method: "POST" };
+  if (body !== undefined) {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify(body);
+  }
+  return fetch(`${API_BASE}${path}`, init)
     .then(() => undefined)
     .catch(() => undefined);
 }

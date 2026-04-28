@@ -22,7 +22,19 @@ import time
 
 from fastapi import APIRouter
 
-HEARTBEAT_TIMEOUT_SEC = int(os.getenv("HEARTBEAT_TIMEOUT", "30"))
+from pydantic import BaseModel
+from typing import Optional
+
+class HeartbeatPayload(BaseModel):
+    state: str = "active"
+
+# 90s default (nới từ 30s) so screen-lock / Alt-Tab pause / network blip do
+# not falsely trigger auto-shutdown. Browsers throttle setInterval timers
+# heavily when a tab is backgrounded or the OS is sleeping; with 10s ping
+# cadence the old 30s window often fired during routine user pauses on
+# long math grades. Override via the HEARTBEAT_TIMEOUT env var when running
+# bare uvicorn for an ad-hoc test that needs faster cleanup.
+HEARTBEAT_TIMEOUT_SEC = int(os.getenv("HEARTBEAT_TIMEOUT", "90"))
 DEV_MODE = os.getenv("DEV_MODE", "0").strip().lower() in ("1", "true", "yes")
 FRONTEND_PORT = "3000"
 
@@ -30,15 +42,20 @@ FRONTEND_PORT = "3000"
 # frontend connects.  This grace period lets the backend boot and answer
 # API-test requests without self-destructing.
 _last_heartbeat: float | None = None
+_is_sleeping: bool = False
 
 router = APIRouter()
 
 
 @router.post("/api/heartbeat")
-async def heartbeat():
+async def heartbeat(payload: Optional[HeartbeatPayload] = None):
     """Reset heartbeat timer — called by the frontend every 10 s."""
-    global _last_heartbeat
+    global _last_heartbeat, _is_sleeping
     _last_heartbeat = time.time()
+    if payload and payload.state == "sleeping":
+        _is_sleeping = True
+    else:
+        _is_sleeping = False
     return {"status": "ok"}
 
 
@@ -95,8 +112,11 @@ def _monitor() -> None:
             if _last_heartbeat is None:
                 continue  # Still waiting for the first heartbeat — don't kill anything
             elapsed = time.time() - _last_heartbeat
-            if elapsed > HEARTBEAT_TIMEOUT_SEC:
-                print(f"[HITL] No heartbeat for {HEARTBEAT_TIMEOUT_SEC}s — shutting down.")
+            # If the browser tab is sleeping (Chrome Memory Saver), extend the timeout
+            # significantly (e.g. to 2 hours) so we don't kill the dev server.
+            effective_timeout = 7200 if _is_sleeping else HEARTBEAT_TIMEOUT_SEC
+            if elapsed > effective_timeout:
+                print(f"[HITL] No heartbeat for {effective_timeout}s — shutting down.")
                 _kill_frontend()
                 os._exit(0)
         except Exception as exc:  # keep the watchdog alive

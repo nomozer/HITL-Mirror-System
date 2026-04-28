@@ -2,8 +2,8 @@
 prompts/cs.py — Tin học-specific prompt content.
 
 Provides Rule 8 (calibration examples) + Rule 9 (code trace crosscheck)
-for CS grading. The rest of the prompt (Rules 1–7, 9b anchors, 10
-preflight, persona, rubric) is shared via ``prompts.base``.
+for CS grading. The rest of the prompt (Rules 1–7, 9b anchors, persona,
+rubric) is shared via ``prompts.base``.
 
 Upgrade tips:
   - Add calibration examples tied to concrete bug categories you see

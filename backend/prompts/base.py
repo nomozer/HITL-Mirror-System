@@ -140,30 +140,25 @@ _RULE_6_STRUCTURE = (
 )
 
 _RULE_7_OUTPUT = (
-    "7. ĐỊNH DẠNG ĐẦU RA (BẮT BUỘC): Chỉ trả về một khối JSON duy nhất, "
-    "không kèm markdown hay lời dẫn. Cấu trúc phải khớp 100% mẫu sau:\n"
+    "7. ĐỊNH DẠNG ĐẦU RA: Chỉ trả về 1 khối JSON, không markdown / lời dẫn. "
+    "Phát đúng theo thứ tự key dưới đây (sống còn khi sát giới hạn token):\n"
     "{\n"
-    '  "transcript": "Nội dung chép lại (Rule 2-5)",\n'
+    '  "scores": {"content": 7.5, "argument": 7.5, "expression": 7.5, "creativity": 7.5},\n'
+    '  "overall": 7.5,\n'
     '  "per_question_feedback": [\n'
-    '    {\n'
-    '      "question": "Câu 1: [Tên chủ đề ngắn gọn]",\n'
-    '      "good_points": "Ghi nhận ưu điểm cụ thể",\n'
-    '      "errors": "Chỉ rõ lỗi và cách sửa"\n'
-    '    }\n'
+    '    {"question": "Câu 1: [chủ đề]", "good_points": "...", "errors": "..."}\n'
     '  ],\n'
-    '  "scores": {\n'
-    '    "content": số, "argument": số, "expression": số, "creativity": số\n'
-    '  },\n'
-    '  "overall": số,\n'
-    '  "comment": "Nhận xét ngắn gọn, bắt đầu ngay bằng Câu 1:"\n'
+    '  "comment": "Câu 1: ...",\n'
+    '  "transcript": "Câu 1: ..."\n'
     "}\n"
-    "\n• scores: thang 10, bội số 0.5. BẮT BUỘC có đủ 4 key.\n"
-    "• overall: trung bình cộng 4 scores, làm tròn 0.5. BẮT BUỘC là số, KHÔNG null.\n"
-    "• per_question_feedback: BẮT BUỘC có đủ số phần tử tương ứng với số câu.\n"
-    "• comment: BẮT BUỘC viết, KHÔNG được rỗng. Mở đầu 'Câu 1:'.\n"
-    "• CẢNH BÁO TRUNCATION: 5 key (transcript, per_question_feedback, "
-    "scores, overall, comment) PHẢI cùng xuất hiện. Nếu cảm thấy hết chỗ, "
-    "rút gọn transcript / comment chứ KHÔNG được bỏ scores hoặc overall."
+    "\nRàng buộc:\n"
+    "• scores: 4 key, thang 10, bội 0.5.\n"
+    "• overall: mean(scores) làm tròn 0.5, là số (không null).\n"
+    "• per_question_feedback: số phần tử = số 'Câu N:' trong transcript; "
+    "mỗi phần tử đủ 3 trường {question, good_points, errors}.\n"
+    "• comment: không rỗng, mở đầu 'Câu 1:'.\n"
+    "• transcript: theo Rule 2–5, đặt cuối vì dài nhất.\n"
+    "• Nếu sắp hết token: rút gọn transcript trước, KHÔNG cắt scores/overall."
 )
 
 _RULE_9B_ANCHORS = (
@@ -185,22 +180,6 @@ _RULE_9B_ANCHORS = (
     "CẤM điểm lẻ không phải bội 0.5 (vd: 6.3, 7.7)."
 )
 
-_RULE_10_PREFLIGHT = (
-    "10. PREFLIGHT — TỰ KIỂM TRA TRƯỚC KHI XUẤT JSON (BẮT BUỘC):\n"
-    "Trả lời nội tâm 6 câu. Nếu câu nào là KHÔNG — sửa rồi mới xuất:\n"
-    "[ ] A. JSON có ĐỦ 5 key bắt buộc: transcript, per_question_feedback, "
-    "scores, overall, comment? (Thiếu bất kỳ key nào = LỖI NGHIÊM TRỌNG, "
-    "tuyệt đối KHÔNG được dừng sau per_question_feedback.)\n"
-    "[ ] B. per_question_feedback có đủ trường {question, good_points, errors}?\n"
-    "[ ] C. len(per_question_feedback) == số 'Câu N:' trong transcript?\n"
-    "[ ] D. Mọi scores ∈ [0, 10] và là bội số 0.5? scores có đủ 4 key "
-    "{content, argument, expression, creativity}?\n"
-    "[ ] E. overall == mean(scores) làm tròn 0.5? (Số, KHÔNG null.)\n"
-    "[ ] F. comment và transcript bắt đầu NGAY bằng 'Câu 1:'? "
-    "comment KHÔNG rỗng?"
-)
-
-
 # ---------------------------------------------------------------------------
 # Compose helper — subject files call this with their own Rule 8 + Rule 9.
 # ---------------------------------------------------------------------------
@@ -211,8 +190,8 @@ def compose_grader_system(rule_8_examples: str, rule_9_crosscheck: str) -> str:
 
     Takes subject-specific Rule 8 (calibration examples) and Rule 9 (logic
     crosscheck) and slots them between the shared rules. Order matters —
-    Rule 10 PREFLIGHT stays last so it's the final instruction the model
-    reads (recency bias).
+    Rule 7 (output spec) stays last so the JSON contract is the final
+    instruction the model reads (recency bias).
     """
     return "\n\n".join([
         _PERSONA,
@@ -227,7 +206,6 @@ def compose_grader_system(rule_8_examples: str, rule_9_crosscheck: str) -> str:
         rule_9_crosscheck,
         _RULE_9B_ANCHORS,
         _RULE_7_OUTPUT,
-        _RULE_10_PREFLIGHT,
     ])
 
 

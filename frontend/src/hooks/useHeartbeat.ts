@@ -8,8 +8,18 @@ import { sendHeartbeat } from "../api";
  */
 export function useHeartbeat(intervalMs: number = 10000): void {
   useEffect(() => {
-    sendHeartbeat();
-    const id = setInterval(sendHeartbeat, intervalMs);
-    return () => clearInterval(id);
+    const doHeartbeat = () => {
+      sendHeartbeat(document.visibilityState === "hidden" ? "sleeping" : "active");
+    };
+
+    doHeartbeat();
+    const id = setInterval(doHeartbeat, intervalMs);
+
+    document.addEventListener("visibilitychange", doHeartbeat);
+
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", doHeartbeat);
+    };
   }, [intervalMs]);
 }

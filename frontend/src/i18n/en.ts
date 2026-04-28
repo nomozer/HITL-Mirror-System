@@ -142,9 +142,14 @@ export const en: I18nStrings = {
   sendComment: "Send",
   aiAnalyzing: "AI is analyzing...",
   noIssues: "No issues to report.",
+  noCommentSalvaged:
+    "Feedback for this question was cut off — verify against the paper or re-grade.",
   salvagedTitle: "Grading output incomplete",
   salvagedBody:
     "The model returned invalid JSON — the content below was salvaged partially. Review carefully before approving, or request a re-grade.",
+  salvagedFinalizeTitle: "AI scores are unreliable",
+  salvagedFinalizeBody:
+    "The AI did not finish grading — scores defaulted to 0. Enter scores manually based on the paper, or go back and re-grade before confirming.",
   verdictDisputeTitle: "AI disagrees",
   verdictDisputeHint:
     "AI thinks this comment may not match the actual student work. Read the analysis above, then choose:",

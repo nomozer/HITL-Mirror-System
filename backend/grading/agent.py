@@ -180,10 +180,15 @@ class AgentOrchestrator:
 
         # Force JSON mime-type + raised token ceiling so the Grader cannot
         # emit truncated / markdown-wrapped output that breaks the review UI.
+        # 32768 buffers long Vietnamese math/CS essays where 16384 was
+        # truncating mid per_question_feedback (CLAUDE.md "stop after PQF"
+        # failure mode). max_output_tokens is a ceiling, not a target —
+        # Gemini stops on its own well below this for short essays, so this
+        # does NOT increase latency on normal grades.
         raw_grade = await self.gemini.call_with_retry(
             grader_bundle.system, grader_bundle.user_content,
             image_parts=image_parts, task_pdf_part=task_pdf_part,
-            json_mode=True, max_output_tokens=16384,
+            json_mode=True, max_output_tokens=32768,
         )
         grade_json = parse_grade_json(raw_grade)
         # Always "stem" for frontend compat — math/cs share the same STEM

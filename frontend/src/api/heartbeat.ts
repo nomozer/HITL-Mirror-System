@@ -5,6 +5,6 @@ import { apiPostQuiet } from "./client";
  * Fire-and-forget — errors are swallowed (the browser may be offline
  * for a moment, and the backend's grace period handles that).
  */
-export function sendHeartbeat(): Promise<void> {
-  return apiPostQuiet("/heartbeat");
+export function sendHeartbeat(state: "active" | "sleeping" = "active"): Promise<void> {
+  return apiPostQuiet("/heartbeat", { state });
 }

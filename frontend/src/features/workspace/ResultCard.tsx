@@ -176,6 +176,20 @@ export function ResultCard({
 
   const overallColor = scoreColor(displayOverall, T);
 
+  // Surface the salvage state from parse_grade_json so the teacher does not
+  // mistake AI-default zeros for a real "0/10" grade. Tab 3 already shows a
+  // banner; without one here, a teacher who landed straight on Tab 5 (e.g.
+  // after approve from a salvaged Tab 3) would see "Tổng điểm: 0/10" with
+  // no context and risk persisting it via /api/finalize-grade.
+  const weaknessList = Array.isArray(grade.weaknesses) ? grade.weaknesses : [];
+  const isSalvaged =
+    Boolean(grade.salvaged) ||
+    weaknessList.some(
+      (w) =>
+        typeof w === "string" &&
+        (w.toLowerCase().includes("unparseable") || w.includes("bị cắt")),
+    );
+
   const formatFinalizedAt = (iso: string | null | undefined) => {
     if (!iso) return "";
     const d = new Date(iso);
@@ -229,6 +243,41 @@ export function ResultCard({
           )}
         </span>
       </div>
+
+      {/* Salvage warning — render before instruction so teacher sees the
+          context before the 0/10 default scores below. */}
+      {!locked && isSalvaged && (
+        <div
+          style={{
+            padding: "12px 16px",
+            marginBottom: 16,
+            background: T.amberSoft,
+            borderLeft: `4px solid ${T.amber}`,
+            borderRadius: 8,
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 10,
+            fontSize: 13.5,
+            color: T.textSoft,
+            lineHeight: 1.55,
+          }}
+        >
+          <Icon.AlertTriangle
+            size={15}
+            color={T.amber}
+            style={{ marginTop: 2, flexShrink: 0 }}
+          />
+          <div>
+            <div style={{ fontWeight: 700, color: T.amber, marginBottom: 3 }}>
+              {String(t.salvagedFinalizeTitle ?? "Điểm AI không đáng tin")}
+            </div>
+            {String(
+              t.salvagedFinalizeBody ??
+                "AI không hoàn tất chấm — điểm tự động đặt về 0. Hãy tự nhập điểm dựa trên bài làm, hoặc quay lại chấm lại trước khi xác nhận.",
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Instruction text */}
       {!locked && (
