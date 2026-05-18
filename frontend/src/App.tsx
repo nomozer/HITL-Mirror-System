@@ -24,6 +24,7 @@ import { TabBar } from "./components/layout/TabBar";
 import { EssayWorkspace } from "./features/workspace/EssayWorkspace";
 import { MemoryPanel } from "./features/memory/MemoryPanel";
 import { HelpModal } from "./features/help/HelpModal";
+import { GradeHistoryDropdown } from "./features/history/GradeHistoryDropdown";
 
 const MEMORY_HASH = "#memory";
 
@@ -66,11 +67,21 @@ function WorkspacePage() {
   const isMobile = useIsMobile();
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  // History dropdown — open state + the trigger button's bounding rect so
+  // the popover anchors under it. AppHeader hands us the rect because the
+  // button ref lives over there.
+  const [historyAnchor, setHistoryAnchor] = useState<DOMRect | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   const closeDrawer = useCallback(() => setDrawerOpen(false), []);
   const openDrawer = useCallback(() => setDrawerOpen(true), []);
   const openHelp = useCallback(() => setHelpOpen(true), []);
   const closeHelp = useCallback(() => setHelpOpen(false), []);
+  const toggleHistory = useCallback((rect: DOMRect | null) => {
+    setHistoryAnchor(rect);
+    setHistoryOpen((v) => !v);
+  }, []);
+  const closeHistory = useCallback(() => setHistoryOpen(false), []);
 
   // "Bộ nhớ HITL" header button: open the memory page in a new browser tab
   // so the workspace tab (uploaded files, in-flight grades, scroll
@@ -153,6 +164,8 @@ function WorkspacePage() {
           onOpenMemory={openMemoryTab}
           onOpenHelp={openHelp}
           memoryActive={false}
+          onToggleHistory={toggleHistory}
+          historyActive={historyOpen}
         />
 
         <TabBar
@@ -198,6 +211,12 @@ function WorkspacePage() {
       )}
 
       {helpOpen && <HelpModal onClose={closeHelp} />}
+
+      <GradeHistoryDropdown
+        open={historyOpen}
+        onClose={closeHistory}
+        anchorRect={historyAnchor}
+      />
     </div>
   );
 }

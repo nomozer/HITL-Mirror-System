@@ -13,32 +13,41 @@ export function ProgressBar({ completed, total, label }: ProgressBarProps) {
       style={{
         display: "flex",
         alignItems: "center",
-        gap: 14,
-        padding: "8px 0 12px",
+        gap: T.space[4],
+        padding: `${T.space[2]}px 0 ${T.space[3]}px`,
       }}
     >
-      {label && <span style={{ fontSize: 13, color: T.textMute, minWidth: 64 }}>{label}</span>}
+      {label && (
+        <span style={{ fontSize: T.fontSize.xs, color: T.textMute, minWidth: 64 }}>
+          {label}
+        </span>
+      )}
       <div
         style={{
           flex: 1,
           height: 2,
           background: T.borderLight,
           position: "relative",
+          overflow: "hidden",
         }}
       >
+        {/* Animate via transform scaleX instead of width so the progress
+            fill runs on the compositor thread — no layout/paint per frame.
+            transformOrigin keeps the fill anchored to the left edge. */}
         <div
           style={{
             position: "absolute",
             inset: 0,
-            width: `${pct}%`,
             background: T.accent,
-            transition: "width 0.6s ease",
+            transformOrigin: "left center",
+            transform: `scaleX(${pct / 100})`,
+            transition: "transform 0.6s ease",
           }}
         />
       </div>
       <span
         style={{
-          fontSize: 13,
+          fontSize: T.fontSize.xs,
           color: T.textMute,
           fontFamily: T.mono,
           minWidth: 40,

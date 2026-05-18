@@ -13,6 +13,7 @@ import { ResultCard } from "./ResultCard";
 import { ErrorBoundary } from "../../components/ui/ErrorBoundary";
 import { StepUpload } from "../upload/StepUpload";
 import { StepReview } from "../review/StepReview";
+import { RegradeMockup } from "../regrade/RegradeMockup";
 import {
   buildTaskContext,
   deriveDisplayStep,
@@ -165,9 +166,23 @@ export function EssayWorkspace({
   const [essayImage, setEssayImage] = useState<EssayFile | null>(null);
   const [grade, setGrade] = useState<Grade | null>(null);
   const [step, setStep] = useState<number>(1);
+  // High-water-mark of the step the teacher reached this session. The
+  // StepIndicator uses this so steps the user walked past keep their
+  // green-check state even when they navigate back (e.g. step 5 →
+  // "Sửa lại" → step 4). Without it, 4 and 5 collapse back to grey,
+  // which read like "you haven't done these" — a bug the teacher
+  // flagged 2026-05-18.
+  const [maxStepReached, setMaxStepReached] = useState<number>(1);
   const [finalizedResult, setFinalizedResult] = useState<FinalizedResult | null>(null);
   const [isFinalizing, setIsFinalizing] = useState<boolean>(false);
   const [finalizeError, setFinalizeError] = useState<string | null>(null);
+  // Teacher per-câu score overrides — lifted up here so step 5 ResultCard
+  // can read the numbers the teacher set in step 4 (without it, step 4's
+  // local state would die on unmount and step 5 would show only AI's
+  // numbers). Reset together with grade when a fresh pipeline finishes
+  // — see the parseGrade effect below.
+  const [finalScores, setFinalScores] = useState<Record<number, number>>({});
+  const [maxOverrides, setMaxOverrides] = useState<Record<number, number>>({});
 
   const taskLabel = useMemo(() => taskFromPdfName(taskPdf?.name), [taskPdf]);
   const task = useMemo(
@@ -184,14 +199,65 @@ export function EssayWorkspace({
       setFinalizedResult(null);
       setIsFinalizing(false);
       setFinalizeError(null);
+      // Discard the previous run's teacher edits — a fresh AI grade
+      // invalidates them. Without this reset, a teacher who edited câu
+      // scores then regraded would see their old overrides applied
+      // against new AI scores, producing nonsense deltas in step 5.
+      setFinalScores({});
+      setMaxOverrides({});
+      // Reset the step high-water-mark — a regrade restarts the review
+      // arc, so the indicator shouldn't claim step 5 is still "done"
+      // from the previous round.
+      setMaxStepReached((prev) => Math.max(prev, 3));
       setStep((s) => stepAfterGrade(s));
     }
   }, [pipeline.code]);
+
+  // Track the highest step the teacher reaches. Plain ratchet — only
+  // moves upward, never resets except on a fresh grade (above).
+  useEffect(() => {
+    setMaxStepReached((prev) => (step > prev ? step : prev));
+  }, [step]);
 
   // Handle pipeline phase changes
   useEffect(() => {
     setStep((s) => nextStepOnPhaseChange(s, pipeline.phase, pipeline.error));
   }, [pipeline.phase, pipeline.error]);
+
+  // Listen for "load cached grade" requests from the header dropdown. Only
+  // the active tab reacts so clicking a history entry routes to the tab
+  // the teacher is currently looking at (mirrors Chrome's "open in current
+  // tab" behavior). Event detail carries the grade id from the cache AND
+  // an optional target step (3 = Xem xét, 4 = Chấm lại, 5 = Xong) — the
+  // dropdown surfaces three jump buttons per entry. Defaults to 3 when
+  // the field is omitted so older event payloads stay compatible.
+  //
+  // We always force the step explicitly after a load. The normal grade
+  // flow goes step 1 → 2 (loading) → 3 (review), and ``stepAfterGrade``
+  // (workspace.logic) only advances from 2 or 4. Cached loads dispatch
+  // PIPELINE_SUCCESS directly without ever entering step 2, so without
+  // this manual setStep the workspace would silently update the underlying
+  // grade state but leave the user stuck on the Upload screen.
+  // ``feedbackHook.reset()`` clears any pending teacher comments from the
+  // previous session — they belong to a different grade.
+  useEffect(() => {
+    if (!active) return;
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ id: string; step?: 3 | 4 | 5 }>).detail;
+      const id = detail?.id;
+      if (typeof id !== "string" || !id) return;
+      const ok = pipeline.loadCachedById(id);
+      if (ok) {
+        feedbackHook.reset();
+        setIsFinalizing(false);
+        setFinalizeError(null);
+        setFinalizedResult(null);
+        setStep(detail?.step ?? 3);
+      }
+    };
+    window.addEventListener("hitl.loadGrade", handler);
+    return () => window.removeEventListener("hitl.loadGrade", handler);
+  }, [active, pipeline, feedbackHook]);
 
   // Report tab metadata
   const label = useMemo(() => taskLabel.slice(0, 30), [taskLabel]);
@@ -228,7 +294,13 @@ export function EssayWorkspace({
   const handleStepClick = useCallback((n: number) => {
     setStep(n);
   }, []);
-  const isStepNavigable = useCallback((n: number) => n === 1 || n === 3, []);
+  // Step 4 (Chấm lại) is normally a transient pipeline loader, but during
+  // the UI mockup phase we expose it as a navigable checkpoint so the
+  // teacher can review the regrade design without triggering a real call.
+  const isStepNavigable = useCallback(
+    (n: number) => n === 1 || n === 3 || n === 4,
+    [],
+  );
 
   // Persist the finalized grade and capture AI↔teacher score delta as a
   // HITL lesson. The UI only locks after the backend confirms persistence.
@@ -309,6 +381,7 @@ export function EssayWorkspace({
       <StepIndicator
         steps={stepLabels}
         currentStep={displayStep}
+        maxStepReached={maxStepReached}
         onStepClick={handleStepClick}
         isStepNavigable={isStepNavigable}
       />
@@ -368,6 +441,8 @@ export function EssayWorkspace({
             pipeline={pipeline}
             feedbackHook={feedbackHook}
             onApprove={handleApprove}
+            onGoToRegrade={() => setStep(4)}
+            onPrev={() => setStep(1)}
             backendSubject={subject}
             task={task}
             t={t}
@@ -377,10 +452,36 @@ export function EssayWorkspace({
       )}
 
       {step === 4 && (
-        <LoadingSpinner
-          title={String(t.step4Title ?? "")}
-          description={String(t.step4Desc ?? "")}
-        />
+        // Mockup phase: step 4 used to be a loading spinner during the
+        // regrade pipeline run. While we're still iterating on the visual,
+        // show the design mockup so the teacher can click into the step
+        // from the stepper and review the layout. If a real regrade ever
+        // lands here while ``phase === "generating"``, fall back to the
+        // loading spinner so the UX matches the rest of the pipeline.
+        pipeline.phase === "generating" ? (
+          <LoadingSpinner
+            title={String(t.step4Title ?? "")}
+            description={String(t.step4Desc ?? "")}
+          />
+        ) : (
+          <ErrorBoundary label="Regrade mockup failed">
+            <RegradeMockup
+              onPrev={() => setStep(3)}
+              onFinish={() => setStep(5)}
+              grade={grade}
+              essayImage={essayImage}
+              finalScores={finalScores}
+              setFinalScores={setFinalScores}
+              maxOverrides={maxOverrides}
+              setMaxOverrides={setMaxOverrides}
+              feedbackHook={feedbackHook}
+              task={task}
+              pipelineCode={pipeline.code}
+              runId={pipeline.runId}
+              subject={subject}
+            />
+          </ErrorBoundary>
+        )
       )}
 
       {step === 5 && (
@@ -391,6 +492,9 @@ export function EssayWorkspace({
             finalized={finalizedResult}
             isFinalizing={isFinalizing}
             finalizeError={finalizeError}
+            subjectLabel={selectedSubject}
+            teacherFinalScores={finalScores}
+            teacherMaxOverrides={maxOverrides}
             onFinalize={async (payload) => {
               if (isFinalizing) return;
               setIsFinalizing(true);
@@ -413,8 +517,13 @@ export function EssayWorkspace({
               }
             }}
             onEdit={() => {
+              // "← Sửa lại" — release the finalized lock AND jump back
+              // to step 4 (Chấm lại) where per-câu editing actually
+              // happens. Without the setStep, the button would only
+              // unlock the UI in place, which doesn't match its label.
               setFinalizedResult(null);
               setFinalizeError(null);
+              setStep(4);
             }}
           />
         </ErrorBoundary>

@@ -77,21 +77,22 @@ export function StepUpload({
   return (
     <div
       style={{
-        maxWidth: 640,
+        maxWidth: T.width.form,
         margin: "0 auto",
         animation: "fadeUp 0.4s ease-out",
       }}
     >
       {/* ── Task PDF Upload ── */}
-      <div style={{ marginBottom: 24 }}>
+      <div style={{ marginBottom: T.space[6] }}>
         <label
           style={{
             display: "block",
-            fontSize: 15,
+            fontFamily: T.display,
+            fontSize: T.fontSize.lg,
             fontWeight: 600,
-            color: T.textSoft,
-            marginBottom: 8,
-            letterSpacing: "0.02em",
+            color: T.text,
+            marginBottom: T.space[2],
+            letterSpacing: "-0.01em",
           }}
         >
           {String(t.promptLabel ?? "")}
@@ -183,14 +184,14 @@ export function StepUpload({
                     PDF
                   </div>
                 </div>
-                <div style={{ fontSize: 15, color: T.textSoft, fontWeight: 500 }}>
+                <div style={{ fontSize: T.fontSize.base, color: T.textSoft, fontWeight: 500 }}>
                   {String(t.promptUploaded ?? "")}
                 </div>
               </div>
               <div
                 style={{
-                  marginTop: 6,
-                  fontSize: 14,
+                  marginTop: T.space[2],
+                  fontSize: T.fontSize.sm,
                   color: T.textMute,
                   textAlign: "center",
                 }}
@@ -203,28 +204,31 @@ export function StepUpload({
             </div>
           ) : (
             <div>
-              <div style={{ marginBottom: 10, opacity: 0.4 }}>
+              <div style={{ marginBottom: T.space[3], opacity: 0.4 }}>
                 <Icon.FileText size={36} color={T.textMute} />
               </div>
-              <div style={{ fontSize: 17, color: T.textSoft, fontWeight: 500 }}>
+              <div style={{ fontSize: T.fontSize.base, color: T.textSoft, fontWeight: 500 }}>
                 {String(t.promptDrop ?? "")}
               </div>
-              <div style={{ fontSize: 13, color: T.textFaint, marginTop: 6 }}>PDF</div>
+              <div style={{ fontSize: T.fontSize.sm, color: T.textFaint, marginTop: T.space[2] }}>
+                PDF
+              </div>
             </div>
           )}
         </div>
       </div>
 
       {/* ── Essay Image/PDF Upload ── */}
-      <div style={{ marginBottom: 32 }}>
+      <div style={{ marginBottom: T.space[8] }}>
         <label
           style={{
             display: "block",
-            fontSize: 15,
+            fontFamily: T.display,
+            fontSize: T.fontSize.lg,
             fontWeight: 600,
-            color: T.textSoft,
-            marginBottom: 8,
-            letterSpacing: "0.02em",
+            color: T.text,
+            marginBottom: T.space[2],
+            letterSpacing: "-0.01em",
           }}
         >
           {String(t.imageLabel ?? "")}
@@ -320,7 +324,7 @@ export function StepUpload({
                   </div>
                   <div
                     style={{
-                      fontSize: 15,
+                      fontSize: T.fontSize.base,
                       color: T.textSoft,
                       fontWeight: 500,
                     }}
@@ -344,8 +348,8 @@ export function StepUpload({
               )}
               <div
                 style={{
-                  marginTop: 10,
-                  fontSize: 14,
+                  marginTop: T.space[3],
+                  fontSize: T.fontSize.sm,
                   color: T.textMute,
                   textAlign: "center",
                 }}
@@ -358,18 +362,20 @@ export function StepUpload({
             </div>
           ) : (
             <div>
-              <div style={{ marginBottom: 12, opacity: 0.45 }}>
+              <div style={{ marginBottom: T.space[3], opacity: 0.45 }}>
                 <Icon.Upload size={44} color={T.textMute} />
               </div>
-              <div style={{ fontSize: 17, color: T.textSoft, fontWeight: 500 }}>
+              <div style={{ fontSize: T.fontSize.base, color: T.textSoft, fontWeight: 500 }}>
                 {String(t.imageDrop ?? "")}
               </div>
-              <div style={{ fontSize: 13, color: T.textFaint, marginTop: 6 }}>JPG, PNG, PDF</div>
+              <div style={{ fontSize: T.fontSize.sm, color: T.textFaint, marginTop: T.space[2] }}>
+                JPG, PNG, PDF
+              </div>
             </div>
           )}
         </div>
         {uploadError && (
-          <div style={{ marginTop: 8, fontSize: 14, color: T.red, lineHeight: 1.5 }}>
+          <div style={{ marginTop: T.space[2], fontSize: T.fontSize.sm, color: T.red, lineHeight: 1.5 }}>
             {uploadError}
           </div>
         )}
@@ -384,8 +390,8 @@ export function StepUpload({
         disabled={!canSubmit}
         style={{
           width: "100%",
-          padding: "14px 24px",
-          fontSize: 17,
+          padding: `${T.space[4]}px ${T.space[6]}px`,
+          fontSize: T.fontSize.base,
           fontWeight: 600,
           color: canSubmit ? T.bgCard : T.textMute,
           background: canSubmit ? T.accent : T.bgMuted,

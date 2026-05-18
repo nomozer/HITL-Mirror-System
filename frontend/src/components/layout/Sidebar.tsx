@@ -45,10 +45,10 @@ export function Sidebar({
         width: "min(86vw, 320px)",
         background: T.bgCard,
         borderRight: `1px solid ${T.border}`,
-        padding: "24px 22px",
+        padding: `${T.space[6]}px ${T.space[5]}px`,
         display: "flex",
         flexDirection: "column",
-        gap: 24,
+        gap: T.space[6],
         boxShadow: T.shadowStrong,
         zIndex: 200,
         animation: "drawerSlideIn 0.24s ease-out",
@@ -57,21 +57,21 @@ export function Sidebar({
     : {
         background: T.bgCard,
         borderRight: `1px solid ${T.border}`,
-        padding: "28px 20px",
+        padding: `${T.space[7]}px ${T.space[5]}px`,
         display: "flex",
         flexDirection: "column",
-        gap: 28,
+        gap: T.space[7],
         height: "100vh",
         position: "sticky",
         top: 0,
       };
 
   const sectionLabelStyle: CSSProperties = {
-    fontSize: 13,
+    fontSize: T.fontSize.xs,
     color: T.textMute,
     textTransform: "uppercase",
     letterSpacing: "0.1em",
-    marginBottom: 10,
+    marginBottom: T.space[3],
     fontWeight: 600,
   };
 
@@ -84,21 +84,31 @@ export function Sidebar({
             <div
               style={{
                 fontFamily: T.display,
-                fontSize: drawer ? 28 : 30,
-                fontWeight: 800,
+                // Brand hero — used to be 3xl/800 on desktop and 2xl/800 on
+                // drawer. The jump from 30 px hero → 14 px tagline → 12 px
+                // section label was too harsh (16 px + 12 px gaps inside
+                // 3 stacked lines, plus weight 800 made it visually ~2×
+                // heavier than anything else). Smoothed to 2xl/xl + weight
+                // 700 so the descending hierarchy is closer to a 1.4× step.
+                fontSize: drawer ? T.fontSize.xl : T.fontSize["2xl"],
+                fontWeight: 700,
                 color: T.accentDark,
                 letterSpacing: 0,
-                lineHeight: 0.95,
+                lineHeight: 1,
               }}
             >
               {String(t.title)}
             </div>
             <div
               style={{
-                fontSize: 14,
+                // Tagline at `base` (16 px) instead of `sm` (14 px): the gap
+                // from the 24 px brand becomes 8 px instead of 16 px, and
+                // tagline → section label ("MÔN HỌC" at xs/12) is now a
+                // sensible 4 px step.
+                fontSize: T.fontSize.base,
                 color: T.textMute,
-                marginTop: 7,
-                lineHeight: 1.3,
+                marginTop: T.space[2],
+                lineHeight: 1.35,
                 letterSpacing: 0,
               }}
             >
@@ -139,6 +149,12 @@ export function Sidebar({
         )}
       </div>
 
+      {/* Subject + Class group — wrapped together so the gap between the
+          two dropdowns (T.space[5] = 20 px) is tighter than the gap from
+          the brand block above (T.space[7] = 28 px, set on the aside).
+          Visually they read as one "selectors" group instead of three
+          equally-spaced sections. */}
+      <div style={{ display: "flex", flexDirection: "column", gap: T.space[5] }}>
       {/* Subject select */}
       <div>
         <div style={sectionLabelStyle}>Môn học</div>
@@ -158,21 +174,28 @@ export function Sidebar({
             style={{
               width: "100%",
               appearance: "none",
-              padding: "10px 30px 10px 12px",
+              padding: `${T.space[3]}px ${T.space[8]}px ${T.space[3]}px ${T.space[3]}px`,
               background: T.bg,
               color: selectedSubject ? T.text : T.textFaint,
-              fontSize: 16,
+              // Native <select> doesn't inherit page font reliably — the
+              // closed trigger usually does, but the opened popup (rendered
+              // by the OS / browser chrome) falls back to a system sans
+              // unless we set font-family on the <select> *and* every
+              // <option>. Setting both keeps the dropdown choices in the
+              // same Newsreader serif as the rest of the app.
+              fontFamily: T.font,
+              fontSize: T.fontSize.base,
               border: `1px solid ${selectedSubject ? T.border : T.accent}`,
               borderRadius: 6,
               cursor: "pointer",
               outline: "none",
             }}
           >
-            <option value="" disabled>
-              — Chọn môn —
+            <option value="" disabled style={{ fontFamily: T.font }}>
+              -- Chọn môn --
             </option>
             {["Môn Tin", "Môn Toán", "Môn Vật lý"].map((sub) => (
-              <option key={sub} value={sub}>
+              <option key={sub} value={sub} style={{ fontFamily: T.font }}>
                 {sub}
               </option>
             ))}
@@ -202,10 +225,11 @@ export function Sidebar({
             style={{
               width: "100%",
               appearance: "none",
-              padding: "10px 30px 10px 12px",
+              padding: `${T.space[3]}px ${T.space[8]}px ${T.space[3]}px ${T.space[3]}px`,
               background: T.bg,
               color: T.text,
-              fontSize: 16,
+              fontFamily: T.font,
+              fontSize: T.fontSize.base,
               border: `1px solid ${T.border}`,
               borderRadius: 6,
               cursor: "pointer",
@@ -213,7 +237,7 @@ export function Sidebar({
             }}
           >
             {["Lớp 10", "Lớp 11", "Lớp 12"].map((cls) => (
-              <option key={cls} value={cls}>
+              <option key={cls} value={cls} style={{ fontFamily: T.font }}>
                 {cls}
               </option>
             ))}
@@ -231,6 +255,7 @@ export function Sidebar({
             <Icon.ArrowDown size={12} />
           </div>
         </div>
+      </div>
       </div>
     </aside>
   );

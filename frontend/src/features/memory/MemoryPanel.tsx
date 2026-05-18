@@ -10,60 +10,89 @@ import { Icon } from "../../components/ui/Icon";
 import { T } from "../../theme/tokens";
 import type { Lesson } from "../../types";
 
-type SubjectFilter = "" | "cs" | "math" | "phys";
+// ---------------------------------------------------------------------------
+// Source / tier model — derives a 5-bucket source tag from the lesson's
+// feedback_score plus a probe of lesson_text. Mirrors how the backend
+// produces lessons:
+//
+//   reject  (5.0) → REJECT
+//   revise  (4.0) → REVISE  (free-form correction note)
+//   delta   (4.0) → Δ-GRADE (numeric-correction lesson, ``format_delta_lesson``)
+//   per-q   (3.5) → PER-CÂU (distilled per-question rule)
+//   approve (3.0) → APPROVE (aggregate comment on approve)
+//
+// Δ-GRADE lessons share score 4.0 with REVISE — they are disambiguated by
+// the Vietnamese prefix that ``backend/grading/scoring.py`` writes into
+// ``lesson_text``. Keep that string in sync if the prompt changes.
+// ---------------------------------------------------------------------------
 
+const DELTA_LESSON_PREFIX = "Hiệu chỉnh điểm";
+
+type SourceTag = "REJECT" | "Δ-GRADE" | "REVISE" | "PER-CÂU" | "APPROVE";
+type SourceFilter = "" | SourceTag;
+// "" = "Mọi môn"; any other string is a subject code returned by the backend
+// (e.g. "math", "cs", "phys", "chem", …). Pills are derived from
+// stats.by_subject so adding a subject on the backend requires no frontend
+// change.
+type SubjectFilter = string;
+
+interface SourceMeta {
+  label: SourceTag;
+  /** Score that defines this bucket — used by the distribution chart. */
+  score: number;
+  /** Display label for the score column in the table. */
+  scoreLabel: string;
+  color: string;
+}
+
+const SOURCE_META: Record<SourceTag, SourceMeta> = {
+  REJECT:    { label: "REJECT",   score: 5.0, scoreLabel: "5.0", color: T.red },
+  "Δ-GRADE": { label: "Δ-GRADE",  score: 4.0, scoreLabel: "4.0", color: T.amber },
+  REVISE:    { label: "REVISE",   score: 4.0, scoreLabel: "4.0", color: T.amber },
+  "PER-CÂU": { label: "PER-CÂU",  score: 3.5, scoreLabel: "3.5", color: T.accent },
+  APPROVE:   { label: "APPROVE",  score: 3.0, scoreLabel: "3.0", color: T.green },
+};
+
+function sourceFromLesson(lesson: Pick<Lesson, "feedback_score" | "lesson_text">): SourceTag {
+  const s = lesson.feedback_score;
+  if (s >= 5.0) return "REJECT";
+  if (s >= 4.0) {
+    return lesson.lesson_text.startsWith(DELTA_LESSON_PREFIX) ? "Δ-GRADE" : "REVISE";
+  }
+  if (s >= 3.5) return "PER-CÂU";
+  return "APPROVE";
+}
+
+// Known subject codes — extend when the backend adds a translated label.
+// Unknown codes fall through to ``subjectLabel`` which capitalizes the raw key,
+// so a brand-new subject (e.g. "chem") still renders without a code change.
 const SUBJECT_LABEL: Record<string, string> = {
-  cs: "Tin",
+  cs: "Tin học",
   math: "Toán",
   phys: "Vật lý",
   stem: "STEM",
-  "": "Khác",
   unknown: "Khác",
 };
 
-const SUBJECT_COLOR: Record<string, string> = {
-  cs: T.accent,
-  math: T.green,
-  phys: T.amber,
-};
-
-interface TierInfo {
-  label: string;
-  color: string;
-  bg: string;
+function subjectLabel(code: string | null | undefined): string {
+  if (!code) return "Khác";
+  if (code in SUBJECT_LABEL) return SUBJECT_LABEL[code];
+  return code.charAt(0).toUpperCase() + code.slice(1);
 }
 
-function tierFromScore(score: number): TierInfo {
-  if (score >= 5.0) return { label: "Từ chối", color: T.red, bg: T.redSoft };
-  if (score >= 4.0) return { label: "Sửa / Hiệu chỉnh", color: T.amber, bg: T.amberSoft };
-  if (score >= 3.5) return { label: "Theo câu", color: T.accent, bg: T.accentSoft };
-  if (score >= 3.0) return { label: "Tổng hợp", color: T.green, bg: T.greenSoft };
-  return { label: "Khác", color: T.textMute, bg: T.bgMuted };
-}
-
-function formatTimestamp(iso: string | null | undefined): string {
+function formatDate(iso: string | null | undefined): string {
   if (!iso) return "—";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString("vi-VN", {
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  // 2026-05-12 — short ISO so the column lines up under a mono font.
+  return d.toISOString().slice(0, 10);
 }
 
-function truncate(text: string, max: number): string {
-  if (!text) return "";
-  if (text.length <= max) return text;
-  return text.slice(0, max).trimEnd() + "…";
+function formatLessonId(id: number): string {
+  return `L-${id.toString().padStart(4, "0")}`;
 }
 
 export function MemoryPanel() {
-  // Close button — when this page was opened via window.open() the browser
-  // lets us close ourselves. For direct navigation (user typed the URL or
-  // refreshed), strip the hash and go back to workspace instead.
   const handleClose = useCallback(() => {
     if (window.opener && !window.opener.closed) {
       window.close();
@@ -76,12 +105,15 @@ export function MemoryPanel() {
   const [lessons, setLessons] = useState<Lesson[]>([]);
   const [stats, setStats] = useState<MemoryStats | null>(null);
   const [subject, setSubject] = useState<SubjectFilter>("");
+  const [source, setSource] = useState<SourceFilter>("");
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<number | null>(null);
-  const [confirmId, setConfirmId] = useState<number | null>(null);
 
+  // Backend filters: subject + free-text search.
+  // Source filter is client-side because it depends on a lesson_text probe
+  // that the SQLite layer doesn't index.
   const fetchAll = useCallback(
     async (signal?: AbortSignal) => {
       setLoading(true);
@@ -104,7 +136,6 @@ export function MemoryPanel() {
     [subject, search],
   );
 
-  // Debounce the search input by 250 ms so each keystroke does not fire a request.
   useEffect(() => {
     const ctrl = new AbortController();
     const handle = setTimeout(() => {
@@ -116,44 +147,70 @@ export function MemoryPanel() {
     };
   }, [fetchAll]);
 
-  const handleDelete = useCallback(
-    async (id: number) => {
-      setDeletingId(id);
-      try {
-        await deleteLesson(id);
-        setLessons((prev) => prev.filter((l) => l.id !== id));
-        // Refresh stats after a delete so totals stay honest.
-        getMemoryStats()
-          .then(setStats)
-          .catch(() => undefined);
-      } catch (err) {
-        const msg = err instanceof ApiError ? err.detail : (err as Error).message;
-        setError(msg || "Xoá bài học thất bại.");
-      } finally {
-        setDeletingId(null);
-        setConfirmId(null);
-      }
-    },
-    [],
+  const handleDelete = useCallback(async (id: number) => {
+    setDeletingId(id);
+    try {
+      await deleteLesson(id);
+      setLessons((prev) => prev.filter((l) => l.id !== id));
+      getMemoryStats()
+        .then(setStats)
+        .catch(() => undefined);
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.detail : (err as Error).message;
+      setError(msg || "Xoá bài học thất bại.");
+    } finally {
+      setDeletingId(null);
+    }
+  }, []);
+
+  // Source filter is client-side; subject + search already happened on the
+  // server. Compute the source tag once per lesson here so the table render
+  // doesn't recompute on every hover.
+  const tagged = useMemo(
+    () => lessons.map((l) => ({ lesson: l, source: sourceFromLesson(l) })),
+    [lessons],
+  );
+  const visible = useMemo(
+    () => (source ? tagged.filter((t) => t.source === source) : tagged),
+    [tagged, source],
   );
 
-  const filterPills = useMemo(
-    () =>
-      [
-        { value: "" as SubjectFilter, label: "Tất cả" },
-        { value: "math" as SubjectFilter, label: "Toán" },
-        { value: "cs" as SubjectFilter, label: "Tin" },
-        { value: "phys" as SubjectFilter, label: "Vật lý" },
-      ],
-    [],
-  );
+  const sourcePills: Array<{ value: SourceFilter; label: string }> = [
+    { value: "",         label: "Tất cả" },
+    { value: "REJECT",   label: "Reject" },
+    { value: "Δ-GRADE",  label: "Δ-grade" },
+    { value: "REVISE",   label: "Revise" },
+    { value: "PER-CÂU",  label: "Per-câu" },
+    { value: "APPROVE",  label: "Approve" },
+  ];
+  // Subject pills are derived from stats.by_subject so the list grows as
+  // the backend adds subjects — no need to keep a hardcoded union in sync.
+  // Sorted by count desc (most-used first) then alphabetical to keep order
+  // stable across renders when counts tie. The currently-selected subject
+  // is always included even if its count drops to 0, so a teacher who has
+  // filtered to a subject doesn't see the active pill vanish mid-session.
+  const subjectPills = useMemo<Array<{ value: SubjectFilter; label: string }>>(() => {
+    const counts = stats?.by_subject ?? {};
+    const codes = new Set<string>(Object.keys(counts).filter((k) => k && counts[k] > 0));
+    if (subject) codes.add(subject);
+    const sorted = Array.from(codes).sort((a, b) => {
+      const diff = (counts[b] ?? 0) - (counts[a] ?? 0);
+      return diff !== 0 ? diff : a.localeCompare(b);
+    });
+    return [
+      { value: "", label: "Mọi môn" },
+      ...sorted.map((c) => ({
+        value: c,
+        label: counts[c] ? `${subjectLabel(c)} (${counts[c]})` : subjectLabel(c),
+      })),
+    ];
+  }, [stats, subject]);
 
   return (
     <div style={{ minHeight: "100vh" }}>
-      {/* Top navigation bar — matches the brand feel of the sidebar */}
       <header
         style={{
-          padding: "12px clamp(16px, 4vw, 40px)",
+          padding: `${T.space[3]}px clamp(16px, 4vw, 40px)`,
           borderBottom: `1px solid ${T.border}`,
           background: T.bgCard,
           position: "sticky",
@@ -161,145 +218,110 @@ export function MemoryPanel() {
           zIndex: 80,
           display: "flex",
           alignItems: "center",
-          justifyContent: "space-between",
-          gap: 16,
+          gap: T.space[4],
         }}
       >
-        <div style={{ minWidth: 0 }}>
-          <div
-            style={{
-              fontFamily: T.display,
-              fontSize: 28,
-              fontWeight: 800,
-              color: T.accentDark,
-              letterSpacing: 0,
-              lineHeight: 0.95,
-            }}
-          >
-            MIRROR
-          </div>
-          <div
-            style={{
-              fontSize: 13,
-              color: T.textMute,
-              marginTop: 3,
-            }}
-          >
-            Bộ nhớ AI
-          </div>
-        </div>
-
-        <button
-          onClick={handleClose}
-          title="Quay lại bàn chấm"
+        <div
           style={{
-            background: T.accent,
-            border: "none",
-            color: "#FFFDF8",
-            padding: "8px 20px",
-            fontSize: 14,
-            fontFamily: T.font,
-            fontWeight: 500,
-            display: "inline-flex",
-            alignItems: "center",
-            gap: 8,
-            borderRadius: 8,
-            cursor: "pointer",
-            transition: "all 0.15s",
-            boxShadow: T.shadowSoft,
-          }}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.background = T.accentDark;
-            e.currentTarget.style.transform = "translateY(-1px)";
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.background = T.accent;
-            e.currentTarget.style.transform = "translateY(0)";
+            fontFamily: T.display,
+            fontSize: T.fontSize.xl,
+            fontWeight: 600,
+            color: T.accentDark,
+            letterSpacing: "-0.01em",
+            lineHeight: 1.2,
           }}
         >
-          <Icon.ArrowLeft size={14} /> Quay lại bàn chấm
-        </button>
+          Bộ nhớ AI
+        </div>
       </header>
 
-      {/* Hero section with stats */}
+      {/* Hero — title + description (left), tier distribution chart (right). */}
       <div
         style={{
-          maxWidth: 960,
+          maxWidth: T.width.app,
           margin: "0 auto",
-          padding: "32px clamp(16px, 4vw, 40px) 0",
+          padding: `${T.space[8]}px clamp(16px, 4vw, 40px) 0`,
+          display: "grid",
+          gridTemplateColumns: "minmax(0, 1fr) auto",
+          gap: T.space[8],
+          alignItems: "start",
         }}
       >
-        <div style={{ marginBottom: 28 }}>
+        <div>
           <h1
             style={{
               fontFamily: T.display,
-              fontSize: 32,
+              fontSize: T.fontSize["3xl"],
               fontWeight: 600,
               color: T.text,
               letterSpacing: "-0.02em",
-              margin: "0 0 8px",
+              fontStyle: "italic",
+              margin: `0 0 ${T.space[3]}px`,
             }}
           >
             Bộ nhớ HITL
           </h1>
           <p
             style={{
-              fontSize: 16,
+              fontSize: T.fontSize.base,
               color: T.textMute,
               margin: 0,
               lineHeight: 1.6,
-              maxWidth: 600,
+              maxWidth: 560,
             }}
           >
-            Mỗi lần bạn duyệt, sửa hoặc từ chối — AI lưu lại làm bài học.
-            Bạn có thể tỉa các bài học không còn đúng.
+            Mỗi lần bạn sửa AI, chúng tôi lưu lại bài học. Bài học có{" "}
+            <span style={{ color: T.red, fontWeight: 600 }}>điểm càng cao</span>{" "}
+            càng ảnh hưởng mạnh tới lần chấm tiếp theo.
           </p>
         </div>
-
-        {/* Stats cards */}
-        {stats && (
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
-              gap: 14,
-              marginBottom: 28,
-            }}
-          >
-            <StatCard label="Tổng bài học" value={stats.total_lessons} color={T.accent} />
-            <StatCard label="Bài đã duyệt" value={stats.total_approved_grades} color={T.green} />
-            <StatCard label="Lượt chấm" value={stats.total_pipeline_runs} color={T.amber} />
-          </div>
-        )}
+        <TierDistribution lessons={lessons} />
       </div>
 
-      {/* Filter & content */}
+      {/* Filter row */}
       <div
         style={{
-          maxWidth: 960,
-          margin: "0 auto",
-          padding: "0 clamp(16px, 4vw, 40px) 96px",
+          maxWidth: T.width.app,
+          margin: `${T.space[7]}px auto 0`,
+          padding: `0 clamp(16px, 4vw, 40px)`,
+          display: "flex",
+          alignItems: "center",
+          gap: T.space[4],
+          flexWrap: "wrap",
         }}
       >
-        <FilterBar
-          pills={filterPills}
-          subject={subject}
-          onSubjectChange={setSubject}
-          search={search}
-          onSearchChange={setSearch}
-          stats={stats}
+        <SearchInput value={search} onChange={setSearch} />
+        <PillGroup
+          pills={sourcePills}
+          active={source}
+          onChange={(v) => setSource(v as SourceFilter)}
         />
+        <div style={{ flex: 1 }} />
+        <PillGroup
+          pills={subjectPills}
+          active={subject}
+          onChange={(v) => setSubject(v as SubjectFilter)}
+        />
+      </div>
 
+      {/* Content */}
+      <div
+        style={{
+          maxWidth: T.width.app,
+          margin: `${T.space[5]}px auto 0`,
+          padding: `0 clamp(16px, 4vw, 40px) 96px`,
+        }}
+      >
         {error && (
           <div
             style={{
-              margin: "0 0 16px",
-              padding: "10px 14px",
+              margin: `0 0 ${T.space[4]}px`,
+              padding: `${T.space[3]}px ${T.space[4]}px`,
               background: T.redSoft,
               border: `1px solid ${T.red}`,
               borderRadius: 8,
               color: T.red,
-              fontSize: 14,
+              fontSize: T.fontSize.sm,
             }}
           >
             <Icon.AlertTriangle size={14} color={T.red} /> {error}
@@ -308,28 +330,17 @@ export function MemoryPanel() {
 
         {loading && lessons.length === 0 ? (
           <SkeletonList />
-        ) : lessons.length === 0 ? (
-          <EmptyState subject={subject} search={search} />
+        ) : visible.length === 0 ? (
+          <EmptyState
+            hasFilter={!!subject || !!search || !!source}
+            onClose={handleClose}
+          />
         ) : (
-          <div
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              gap: 14,
-            }}
-          >
-            {lessons.map((lesson) => (
-              <LessonCard
-                key={lesson.id}
-                lesson={lesson}
-                isConfirming={confirmId === lesson.id}
-                isDeleting={deletingId === lesson.id}
-                onAskDelete={() => setConfirmId(lesson.id)}
-                onCancelDelete={() => setConfirmId(null)}
-                onConfirmDelete={() => handleDelete(lesson.id)}
-              />
-            ))}
-          </div>
+          <LessonTable
+            rows={visible}
+            deletingId={deletingId}
+            onDelete={handleDelete}
+          />
         )}
       </div>
     </div>
@@ -340,365 +351,362 @@ export function MemoryPanel() {
 // Sub-components
 // ---------------------------------------------------------------------------
 
-function StatCard({ label, value, color }: { label: string; value: number; color: string }) {
-  return (
-    <div
-      style={{
-        background: T.bgCard,
-        border: `1px solid ${T.border}`,
-        borderRadius: 12,
-        padding: "20px 22px",
-        boxShadow: T.shadowSoft,
-        borderTop: `3px solid ${color}`,
-      }}
-    >
-      <div
-        style={{
-          fontFamily: T.display,
-          fontSize: 32,
-          fontWeight: 600,
-          color: T.text,
-          lineHeight: 1,
-          marginBottom: 6,
-        }}
-      >
-        {value}
-      </div>
-      <div
-        style={{
-          fontSize: 14,
-          color: T.textMute,
-          fontWeight: 500,
-        }}
-      >
-        {label}
-      </div>
-    </div>
-  );
-}
+function TierDistribution({ lessons }: { lessons: Lesson[] }) {
+  // 4 buckets keyed by score — REVISE and Δ-GRADE both fall in 4.0, so the
+  // chart shows the combined "score 4" column. The table column still
+  // distinguishes them via the NGUỒN tag.
+  const buckets: Array<{ score: number; label: string; color: string }> = [
+    { score: 5.0, label: "score 5",   color: T.red },
+    { score: 4.0, label: "score 4",   color: T.amber },
+    { score: 3.5, label: "score 3.5", color: T.accent },
+    { score: 3.0, label: "score 3",   color: T.green },
+  ];
+  const counts = buckets.map((b) => ({
+    ...b,
+    count: lessons.filter((l) => Math.abs(l.feedback_score - b.score) < 0.01).length,
+  }));
+  const max = Math.max(1, ...counts.map((b) => b.count));
+  const barAreaHeight = 64;
 
-function FilterBar({
-  pills,
-  subject,
-  onSubjectChange,
-  search,
-  onSearchChange,
-  stats,
-}: {
-  pills: Array<{ value: SubjectFilter; label: string }>;
-  subject: SubjectFilter;
-  onSubjectChange: (s: SubjectFilter) => void;
-  search: string;
-  onSearchChange: (s: string) => void;
-  stats: MemoryStats | null;
-}) {
   return (
     <div
       style={{
         display: "flex",
-        alignItems: "center",
-        gap: 12,
-        flexWrap: "wrap",
-        padding: "14px 0 18px",
-        borderBottom: `1px solid ${T.border}`,
-        marginBottom: 20,
+        alignItems: "flex-end",
+        gap: T.space[4],
       }}
     >
-      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-        {pills.map((pill) => {
-          const active = pill.value === subject;
-          const count =
-            pill.value === ""
-              ? stats?.total_lessons
-              : stats?.by_subject[pill.value] ?? 0;
-          return (
-            <button
-              key={pill.value || "all"}
-              onClick={() => onSubjectChange(pill.value)}
+      {counts.map((b) => {
+        const h = b.count === 0 ? 4 : Math.max(8, (b.count / max) * barAreaHeight);
+        return (
+          <div
+            key={b.score}
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: T.space[1],
+            }}
+          >
+            <span
               style={{
-                background: active ? T.accent : "transparent",
-                border: `1px solid ${active ? T.accent : T.border}`,
-                color: active ? "#FFFDF8" : T.textSoft,
-                padding: "7px 16px",
-                fontSize: 14,
-                fontFamily: T.font,
-                borderRadius: 999,
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 7,
-                transition: "all 0.15s",
-                cursor: "pointer",
+                fontFamily: T.mono,
+                fontSize: T.fontSize.xs,
+                color: b.color,
+                fontWeight: 600,
+                lineHeight: 1,
               }}
             >
-              {pill.label}
-              {count !== undefined && (
-                <span
-                  style={{
-                    fontFamily: T.mono,
-                    fontSize: 13,
-                    opacity: active ? 0.85 : 0.6,
-                  }}
-                >
-                  {count}
-                </span>
-              )}
-            </button>
-          );
-        })}
-      </div>
-
-      <div
-        style={{
-          flex: 1,
-          minWidth: 200,
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          background: T.bgInput,
-          border: `1px solid ${T.border}`,
-          padding: "6px 12px",
-          borderRadius: 6,
-        }}
-      >
-        <Icon.MessageCircle size={14} color={T.textFaint} />
-        <input
-          value={search}
-          onChange={(e) => onSearchChange(e.target.value)}
-          placeholder="Tìm trong nội dung bài học hoặc đề bài…"
-          style={{
-            flex: 1,
-            background: "transparent",
-            border: "none",
-            outline: "none",
-            color: T.text,
-            fontSize: 15,
-            fontFamily: T.font,
-          }}
-        />
-        {search && (
-          <button
-            onClick={() => onSearchChange("")}
-            style={{
-              background: "transparent",
-              border: "none",
-              color: T.textFaint,
-              cursor: "pointer",
-              padding: 2,
-              display: "inline-flex",
-            }}
-            title="Xoá tìm kiếm"
-          >
-            <Icon.X size={12} />
-          </button>
-        )}
-      </div>
+              {b.count}
+            </span>
+            <div
+              style={{
+                width: 24,
+                height: h,
+                background: b.color,
+                opacity: b.count === 0 ? 0.25 : 1,
+                borderRadius: 2,
+                transition: "height 0.3s ease",
+              }}
+            />
+            <span
+              style={{
+                fontFamily: T.mono,
+                fontSize: T.fontSize.xs,
+                color: T.textMute,
+                lineHeight: 1,
+              }}
+            >
+              {b.label}
+            </span>
+          </div>
+        );
+      })}
     </div>
   );
 }
 
-function LessonCard({
-  lesson,
-  isConfirming,
-  isDeleting,
-  onAskDelete,
-  onCancelDelete,
-  onConfirmDelete,
+function SearchInput({
+  value,
+  onChange,
 }: {
-  lesson: Lesson;
-  isConfirming: boolean;
-  isDeleting: boolean;
-  onAskDelete: () => void;
-  onCancelDelete: () => void;
-  onConfirmDelete: () => void;
+  value: string;
+  onChange: (v: string) => void;
 }) {
-  const tier = tierFromScore(lesson.feedback_score);
-  const subjLabel = SUBJECT_LABEL[lesson.subject] ?? lesson.subject ?? "Khác";
-  const subjColor = SUBJECT_COLOR[lesson.subject] ?? T.textMute;
-
   return (
-    <article
+    <div
       style={{
-        background: T.bgCard,
+        minWidth: 240,
+        maxWidth: 320,
+        display: "flex",
+        alignItems: "center",
+        gap: T.space[2],
+        background: T.bgInput,
         border: `1px solid ${T.border}`,
-        borderRadius: 10,
-        padding: "16px 18px",
-        boxShadow: T.shadowSoft,
-        opacity: isDeleting ? 0.5 : 1,
-        transition: "opacity 0.2s",
+        padding: `${T.space[2]}px ${T.space[3]}px`,
+        borderRadius: 8,
       }}
     >
-      <div
+      <Icon.MessageCircle size={14} color={T.textFaint} />
+      <input
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="Tìm trong bài học…"
         style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          flexWrap: "wrap",
-          marginBottom: 10,
-        }}
-      >
-        <span
-          style={{
-            background: `${subjColor}1A`,
-            color: subjColor,
-            padding: "3px 11px",
-            borderRadius: 999,
-            fontSize: 13,
-            fontWeight: 600,
-            letterSpacing: "0.02em",
-          }}
-        >
-          {subjLabel}
-        </span>
-        <span
-          style={{
-            background: tier.bg,
-            color: tier.color,
-            padding: "3px 11px",
-            borderRadius: 999,
-            fontSize: 13,
-            fontWeight: 500,
-          }}
-        >
-          {tier.label}
-        </span>
-        <span
-          style={{
-            fontFamily: T.mono,
-            fontSize: 12,
-            color: T.textFaint,
-          }}
-          title="Điểm ưu tiên — càng cao càng ảnh hưởng mạnh đến lần chấm sau"
-        >
-          ưu tiên {lesson.feedback_score.toFixed(1)}
-        </span>
-        <span style={{ flex: 1 }} />
-        <span style={{ fontSize: 13, color: T.textMute, fontFamily: T.mono }}>
-          {formatTimestamp(lesson.timestamp)}
-        </span>
-        <span style={{ fontSize: 12, color: T.textFaint, fontFamily: T.mono }}>
-          #{lesson.id}
-        </span>
-      </div>
-
-      <div
-        style={{
-          fontSize: 14,
-          color: T.textMute,
-          marginBottom: 10,
-          fontStyle: "italic",
-          lineHeight: 1.5,
-        }}
-      >
-        Đề: {truncate(lesson.task, 140) || "(không có)"}
-      </div>
-
-      <div
-        style={{
-          fontSize: 16,
+          flex: 1,
+          background: "transparent",
+          border: "none",
+          outline: "none",
           color: T.text,
-          lineHeight: 1.6,
-          whiteSpace: "pre-wrap",
+          fontSize: T.fontSize.sm,
+          fontFamily: T.font,
+          minWidth: 0,
         }}
-      >
-        {lesson.lesson_text}
-      </div>
+      />
+      {value && (
+        <button
+          onClick={() => onChange("")}
+          style={{
+            background: "transparent",
+            border: "none",
+            color: T.textFaint,
+            cursor: "pointer",
+            padding: 2,
+            display: "inline-flex",
+          }}
+          title="Xoá tìm kiếm"
+        >
+          <Icon.X size={12} />
+        </button>
+      )}
+    </div>
+  );
+}
 
-      <div
-        style={{
-          marginTop: 12,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "flex-end",
-          gap: 8,
-        }}
-      >
-        {!isConfirming ? (
+function PillGroup<V extends string>({
+  pills,
+  active,
+  onChange,
+}: {
+  pills: Array<{ value: V; label: string }>;
+  active: V;
+  onChange: (v: V) => void;
+}) {
+  return (
+    <div style={{ display: "flex", gap: T.space[1], flexWrap: "wrap" }}>
+      {pills.map((pill) => {
+        const isActive = pill.value === active;
+        return (
           <button
-            onClick={onAskDelete}
-            disabled={isDeleting}
+            key={pill.value || "_all"}
+            onClick={() => onChange(pill.value)}
             style={{
-              background: "transparent",
-              border: `1px solid ${T.border}`,
-              color: T.textMute,
-              padding: "6px 14px",
-              fontSize: 14,
+              background: isActive ? T.text : "transparent",
+              border: `1px solid ${isActive ? T.text : T.border}`,
+              color: isActive ? T.bgCard : T.textSoft,
+              padding: `${T.space[1]}px ${T.space[3]}px`,
+              fontSize: T.fontSize.sm,
               fontFamily: T.font,
-              borderRadius: 6,
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 6,
-              cursor: isDeleting ? "wait" : "pointer",
+              borderRadius: 999,
+              cursor: "pointer",
               transition: "all 0.15s",
             }}
             onMouseEnter={(e) => {
-              e.currentTarget.style.borderColor = T.red;
-              e.currentTarget.style.color = T.red;
+              if (!isActive) {
+                e.currentTarget.style.borderColor = T.text;
+                e.currentTarget.style.color = T.text;
+              }
             }}
             onMouseLeave={(e) => {
-              e.currentTarget.style.borderColor = T.border;
-              e.currentTarget.style.color = T.textMute;
+              if (!isActive) {
+                e.currentTarget.style.borderColor = T.border;
+                e.currentTarget.style.color = T.textSoft;
+              }
             }}
           >
-            <Icon.X size={11} /> Quên bài học này
+            {pill.label}
           </button>
-        ) : (
-          <>
-            <span style={{ fontSize: 14, color: T.red, marginRight: 4 }}>
-              Xoá vĩnh viễn?
-            </span>
-            <button
-              onClick={onCancelDelete}
-              disabled={isDeleting}
-              style={{
-                background: "transparent",
-                border: `1px solid ${T.border}`,
-                color: T.textSoft,
-                padding: "6px 14px",
-                fontSize: 14,
-                fontFamily: T.font,
-                borderRadius: 6,
-                cursor: "pointer",
-              }}
-            >
-              Huỷ
-            </button>
-            <button
-              onClick={onConfirmDelete}
-              disabled={isDeleting}
-              style={{
-                background: T.red,
-                border: `1px solid ${T.red}`,
-                color: "#FFFDF8",
-                padding: "6px 16px",
-                fontSize: 14,
-                fontFamily: T.font,
-                borderRadius: 6,
-                cursor: isDeleting ? "wait" : "pointer",
-                fontWeight: 500,
-              }}
-            >
-              {isDeleting ? "Đang xoá…" : "Xoá"}
-            </button>
-          </>
-        )}
-      </div>
-    </article>
+        );
+      })}
+    </div>
+  );
+}
+
+interface TaggedLesson {
+  lesson: Lesson;
+  source: SourceTag;
+}
+
+function LessonTable({
+  rows,
+  deletingId,
+  onDelete,
+}: {
+  rows: TaggedLesson[];
+  deletingId: number | null;
+  onDelete: (id: number) => void;
+}) {
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <table
+        style={{
+          width: "100%",
+          borderCollapse: "collapse",
+          tableLayout: "fixed",
+        }}
+      >
+        <colgroup>
+          <col style={{ width: 88 }} />
+          <col style={{ width: 80 }} />
+          <col />
+          <col style={{ width: 96 }} />
+          <col style={{ width: 96 }} />
+          <col style={{ width: 112 }} />
+          <col style={{ width: 48 }} />
+        </colgroup>
+        <thead>
+          <tr style={{ borderBottom: `1px solid ${T.border}` }}>
+            {["ID", "SCORE", "BÀI HỌC", "MÔN", "NGUỒN", "NGÀY", ""].map((h, i) => (
+              <th
+                key={i}
+                style={{
+                  textAlign: "left",
+                  padding: `${T.space[3]}px ${T.space[3]}px`,
+                  fontSize: T.fontSize.xs,
+                  letterSpacing: "0.08em",
+                  textTransform: "uppercase",
+                  fontWeight: 600,
+                  color: T.textMute,
+                  fontFamily: T.mono,
+                }}
+              >
+                {h}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(({ lesson, source }) => (
+            <LessonRow
+              key={lesson.id}
+              lesson={lesson}
+              source={source}
+              isDeleting={deletingId === lesson.id}
+              onDelete={() => onDelete(lesson.id)}
+            />
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function LessonRow({
+  lesson,
+  source,
+  isDeleting,
+  onDelete,
+}: {
+  lesson: Lesson;
+  source: SourceTag;
+  isDeleting: boolean;
+  onDelete: () => void;
+}) {
+  const [hovered, setHovered] = useState(false);
+  const meta = SOURCE_META[source];
+  const subjLabel = subjectLabel(lesson.subject);
+
+  const cellStyle: React.CSSProperties = {
+    padding: `${T.space[3]}px ${T.space[3]}px`,
+    verticalAlign: "top",
+    fontSize: T.fontSize.sm,
+    lineHeight: 1.55,
+  };
+
+  return (
+    <tr
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      style={{
+        borderBottom: `1px solid ${T.borderLight}`,
+        background: hovered ? T.bgHover : "transparent",
+        opacity: isDeleting ? 0.45 : 1,
+        transition: "background 0.15s, opacity 0.2s",
+      }}
+    >
+      <td style={{ ...cellStyle, fontFamily: T.mono, color: T.textMute, fontSize: T.fontSize.xs }}>
+        {formatLessonId(lesson.id)}
+      </td>
+      <td
+        style={{
+          ...cellStyle,
+          fontFamily: T.mono,
+          color: meta.color,
+          fontWeight: 600,
+        }}
+      >
+        {meta.scoreLabel}
+      </td>
+      <td style={{ ...cellStyle, color: T.text }}>{lesson.lesson_text}</td>
+      <td style={{ ...cellStyle, color: T.textSoft }}>{subjLabel}</td>
+      <td
+        style={{
+          ...cellStyle,
+          fontFamily: T.mono,
+          fontSize: T.fontSize.xs,
+          letterSpacing: "0.05em",
+          color: meta.color,
+          fontWeight: 600,
+        }}
+      >
+        {meta.label}
+      </td>
+      <td
+        style={{
+          ...cellStyle,
+          fontFamily: T.mono,
+          fontSize: T.fontSize.xs,
+          color: T.textMute,
+        }}
+      >
+        {formatDate(lesson.timestamp)}
+      </td>
+      <td style={{ ...cellStyle, textAlign: "right" }}>
+        <button
+          onClick={onDelete}
+          disabled={isDeleting}
+          title="Quên bài học này"
+          aria-label="Quên bài học này"
+          style={{
+            background: "transparent",
+            border: "none",
+            color: hovered ? T.red : "transparent",
+            cursor: isDeleting ? "wait" : "pointer",
+            padding: T.space[1],
+            display: "inline-flex",
+            transition: "color 0.15s",
+          }}
+        >
+          <Icon.X size={14} />
+        </button>
+      </td>
+    </tr>
   );
 }
 
 function SkeletonList() {
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-      {[0, 1, 2].map((i) => (
+    <div style={{ display: "flex", flexDirection: "column", gap: T.space[2] }}>
+      {[0, 1, 2, 3, 4].map((i) => (
         <div
           key={i}
           style={{
-            height: 110,
+            height: 48,
             background: T.bgCard,
-            border: `1px solid ${T.border}`,
-            borderRadius: 10,
+            border: `1px solid ${T.borderLight}`,
+            borderRadius: 4,
             opacity: 0.5,
-            animation: `pulse 1.4s ease-in-out ${i * 0.15}s infinite`,
+            animation: `pulse 1.4s ease-in-out ${i * 0.1}s infinite`,
           }}
         />
       ))}
@@ -706,14 +714,19 @@ function SkeletonList() {
   );
 }
 
-function EmptyState({ subject, search }: { subject: SubjectFilter; search: string }) {
-  const filtering = subject !== "" || search !== "";
+function EmptyState({
+  hasFilter,
+  onClose,
+}: {
+  hasFilter: boolean;
+  onClose: () => void;
+}) {
   return (
     <div
       style={{
-        maxWidth: 480,
-        margin: "60px auto 0",
-        padding: "32px clamp(20px, 5vw, 32px)",
+        maxWidth: 560,
+        margin: `${T.space[8]}px auto 0`,
+        padding: `${T.space[8]}px clamp(${T.space[6]}px, 5vw, ${T.space[10]}px)`,
         background: T.bgCard,
         border: `1px solid ${T.border}`,
         borderRadius: 12,
@@ -726,32 +739,71 @@ function EmptyState({ subject, search }: { subject: SubjectFilter; search: strin
           display: "inline-flex",
           alignItems: "center",
           justifyContent: "center",
-          width: 56,
-          height: 56,
+          width: 72,
+          height: 72,
           borderRadius: "50%",
           background: T.accentSoft,
-          marginBottom: 14,
+          marginBottom: T.space[5],
         }}
       >
-        <Icon.Lightbulb size={28} color={T.accent} />
+        <Icon.Lightbulb size={36} color={T.accent} />
       </div>
       <div
         style={{
           fontFamily: T.display,
-          fontSize: 20,
+          fontSize: T.fontSize["2xl"],
           fontWeight: 600,
           color: T.text,
-          marginBottom: 10,
+          marginBottom: T.space[3],
           letterSpacing: "-0.01em",
         }}
       >
-        {filtering ? "Không có bài học khớp bộ lọc" : "Chưa có bài học nào"}
+        {hasFilter ? "Không có bài học khớp bộ lọc" : "Chưa có bài học nào"}
       </div>
-      <div style={{ fontSize: 15, color: T.textSoft, lineHeight: 1.65 }}>
-        {filtering
-          ? "Thử bỏ bộ lọc môn hoặc xoá ô tìm kiếm để xem toàn bộ kho bài học."
+      <div
+        style={{
+          fontSize: T.fontSize.base,
+          color: T.textSoft,
+          lineHeight: 1.65,
+          marginBottom: T.space[6],
+        }}
+      >
+        {hasFilter
+          ? "Thử bỏ bộ lọc hoặc xoá ô tìm kiếm để xem toàn bộ kho bài học."
           : "Khi bạn duyệt, sửa hoặc từ chối các bài chấm, AI sẽ ghi nhớ chỗ này. Hãy chấm vài bài rồi quay lại."}
       </div>
+      {!hasFilter && (
+        <button
+          onClick={onClose}
+          style={{
+            background: T.accent,
+            border: "none",
+            color: "#FFFDF8",
+            padding: `${T.space[3]}px ${T.space[6]}px`,
+            fontSize: T.fontSize.base,
+            fontFamily: T.font,
+            fontWeight: 500,
+            borderRadius: 8,
+            cursor: "pointer",
+            display: "inline-flex",
+            alignItems: "center",
+            gap: T.space[2],
+            transition: "background 0.15s, transform 0.15s",
+            boxShadow: T.shadowSoft,
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.background = T.accentDark;
+            e.currentTarget.style.transform = "translateY(-1px)";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = T.accent;
+            e.currentTarget.style.transform = "translateY(0)";
+          }}
+        >
+          <Icon.ArrowLeft size={14} /> Quay lại chấm bài
+        </button>
+      )}
     </div>
   );
 }
+

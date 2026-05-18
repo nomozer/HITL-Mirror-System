@@ -118,9 +118,13 @@ _RULE_6_STRUCTURE = (
     "có lời dẫn / nhận xét chung trước 'Câu 1:'. Số segment 'Câu N:' ở "
     "comment PHẢI khớp chính xác transcript — không bỏ sót, không gộp.\n"
     "• per_question_feedback: Mảng đối tượng phản hồi (Dữ liệu quan trọng nhất "
-    "cho Tab 5). Mỗi phần tử gồm {question, good_points, errors}. "
-    "Trường 'question' PHẢI có định dạng: \"Câu N: [Chủ đề bài tập]\" "
-    "(Ví dụ: \"Câu 1: Tính toán theo quy trình máy tính\").\n"
+    "cho Tab 5). Mỗi phần tử gồm {question, max_points, score, good_points, "
+    "errors}. Trường 'question' PHẢI có định dạng: \"Câu N: [Chủ đề bài tập]\" "
+    "(Ví dụ: \"Câu 1: Tính toán theo quy trình máy tính\"). "
+    "Trường 'max_points' = thang điểm câu đó (vd 3.0 hoặc 4.0, bội 0.5). "
+    "Trường 'score' = điểm AI cho câu, 0 ≤ score ≤ max_points, bội 0.5. "
+    "Đọc thang điểm từng câu trong đề (task PDF) nếu có; nếu đề không ghi "
+    "thang riêng, chia đều 10 điểm cho tổng số câu (bội 0.5).\n"
     "• comment: Nhận xét tổng quát từng câu, cũng mở đầu 'Câu 1:', 'Câu 2:', "
     "… Giữ nhận xét cô đọng (≤40 từ/câu).\n"
     "• GIỌNG: nhẹ nhàng, động viên. Ghi điểm tốt TRƯỚC rồi gợi ý cải thiện. "
@@ -130,10 +134,11 @@ _RULE_6_STRUCTURE = (
     "sau thử viết ý sơ lược, có một phần điểm vẫn hơn bỏ trống.'). "
     "per_question_feedback cho câu trống: good_points='', "
     "errors='Câu bị bỏ trống — không có nội dung để chấm.'\n"
-    "• per_question_feedback: mảng {question, good_points, errors}, số phần "
-    "tử == số 'Câu N:'. good_points ghi nhận điểm đúng (cả phần). errors "
-    "diễn đạt lỗi như cơ hội học hỏi — chỉ bước nào sai + cách sửa, không "
-    "nói 'sai' trống không.\n"
+    "• per_question_feedback: mảng {question, max_points, score, "
+    "good_points, errors}, số phần tử == số 'Câu N:'. good_points ghi "
+    "nhận điểm đúng (cả phần). errors diễn đạt lỗi như cơ hội học hỏi — "
+    "chỉ bước nào sai + cách sửa, không nói 'sai' trống không. "
+    "max_points + score là số (không null, bội 0.5).\n"
     "• HÌNH / BẢNG: wrapper '[Hình vẽ: …]', '[Sơ đồ: …]', '[Bảng: …]'. Hình "
     "học theo khuôn '<loại> + <tính chất> + <phần tử phụ>', dưới 200 ký tự. "
     "KHÔNG ASCII art hay SVG."
@@ -146,7 +151,8 @@ _RULE_7_OUTPUT = (
     '  "scores": {"content": 7.5, "argument": 7.5, "expression": 7.5, "creativity": 7.5},\n'
     '  "overall": 7.5,\n'
     '  "per_question_feedback": [\n'
-    '    {"question": "Câu 1: [chủ đề]", "good_points": "...", "errors": "..."}\n'
+    '    {"question": "Câu 1: [chủ đề]", "max_points": 3.0, "score": 3.0, '
+    '"good_points": "...", "errors": "..."}\n'
     '  ],\n'
     '  "comment": "Câu 1: ...",\n'
     '  "transcript": "Câu 1: ..."\n'
@@ -155,10 +161,14 @@ _RULE_7_OUTPUT = (
     "• scores: 4 key, thang 10, bội 0.5.\n"
     "• overall: mean(scores) làm tròn 0.5, là số (không null).\n"
     "• per_question_feedback: số phần tử = số 'Câu N:' trong transcript; "
-    "mỗi phần tử đủ 3 trường {question, good_points, errors}.\n"
+    "mỗi phần tử đủ 5 trường {question, max_points, score, good_points, "
+    "errors}.\n"
+    "• max_points + score: số thực bội 0.5; 0 ≤ score ≤ max_points; "
+    "sum(max_points) phải = 10.0 (hoặc thang tổng đề ghi rõ).\n"
     "• comment: không rỗng, mở đầu 'Câu 1:'.\n"
     "• transcript: theo Rule 2–5, đặt cuối vì dài nhất.\n"
-    "• Nếu sắp hết token: rút gọn transcript trước, KHÔNG cắt scores/overall."
+    "• Nếu sắp hết token: rút gọn transcript trước, KHÔNG cắt scores / overall "
+    "/ max_points / score."
 )
 
 _RULE_9B_ANCHORS = (

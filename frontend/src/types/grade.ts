@@ -11,6 +11,14 @@ export interface RubricScores {
 
 export interface PerQuestionFeedback {
   question?: string;
+  /** Per-question max points on the 10-scale (e.g. 3.0). Backend started
+   *  emitting this alongside the textual feedback so step-5 phiếu chấm
+   *  can render real scores instead of mocked ones. Optional because
+   *  older grade JSONs (pre-schema-bump) won't carry it. */
+  max_points?: number;
+  /** AI's score for this question (0 ≤ score ≤ max_points, step 0.5).
+   *  Optional for the same backward-compat reason as max_points. */
+  score?: number;
   good_points?: string;
   errors?: string;
 }

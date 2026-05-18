@@ -1,7 +1,14 @@
-import { useState, useCallback, useMemo, useEffect } from "react";
+import { useState, useCallback, useMemo } from "react";
 import { T } from "../../theme/tokens";
 import { Icon } from "../../components/ui/Icon";
+import { OriginalImageModal } from "../../components/ui/OriginalImageModal";
 import { formatTranscript } from "../../lib/mathFormat";
+import {
+  buildSyntheticAnnotations,
+  parseCauHeader,
+  splitTranscriptByCau,
+} from "../../lib/grade";
+import { getStageableLesson } from "../../lib/hitl";
 import { analyzeComment } from "../../api";
 import { useIsMobile } from "../../hooks/useIsMobile";
 import type {
@@ -11,28 +18,14 @@ import type {
   EssayFile,
   Grade,
   I18nStrings,
+  Lesson,
+  PerQuestionFeedback,
   StagedLesson,
   Subject,
   ThreadMessage,
 } from "../../types";
 import type { UseAgentPipelineResult } from "../../hooks/useAgentPipeline";
 import type { UseFeedbackResult } from "../../hooks/useFeedback";
-
-function parseMarkdown(md: string): string {
-  if (!md) return "";
-  const html = md
-    .replace(/^### (.+)$/gm, "<h3>$1</h3>")
-    .replace(/^## (.+)$/gm, "<h2>$1</h2>")
-    .replace(/^# (.+)$/gm, "<h1>$1</h1>")
-    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*(.+?)\*/g, "<em>$1</em>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/^[-•]\s+(.+)$/gm, "<li>$1</li>")
-    .replace(/(<li>.*<\/li>\n?)+/gs, (m) => `<ul>${m}</ul>`)
-    .replace(/\n{2,}/g, "</p><p>")
-    .replace(/\n/g, "<br/>");
-  return `<p>${html}</p>`;
-}
 
 interface QuestionPart {
   idx: number;
@@ -103,30 +96,9 @@ function buildAnalyzeQuestionContext(
   return parts.join("\n");
 }
 
-/**
- * Find the most recent AI lesson the teacher hasn't actively rejected.
- *
- * Verdict gating:
- *   - "agree" / "partial":  always stageable
- *   - "dispute":            only stageable when teacher explicitly chose
- *                           ``disputeDecision === "apply"``. This is the
- *                           anti-poison guard — AI flagged the teacher
- *                           comment as wrong, so we won't write a lesson
- *                           into HITL memory unless the teacher overrides.
- */
-function getStageableLesson(messages: ThreadMessage[]): string {
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const message = messages[i];
-    if (message?.type !== "ai") continue;
-    const lesson = String(message.lesson || "").trim();
-    if (!lesson) continue;
-    if (message.verdict === "dispute" && message.disputeDecision !== "apply") {
-      return "";
-    }
-    return lesson;
-  }
-  return "";
-}
+// getStageableLesson lifted to lib/hitl.ts so step 4 (RegradeMockup) can
+// reuse the anti-poison gating when staging chat lessons on "Hoàn tất bài
+// này".
 
 // ---------------------------------------------------------------------------
 // Align transcript parts with AI comment parts BY QUESTION NUMBER.
@@ -485,6 +457,41 @@ interface QuestionBoxProps {
    */
   isSalvaged: boolean;
   stacked: boolean;
+  /**
+   * Structured per-question feedback from ``grade.per_question_feedback``.
+   * The AI emits ``good_points`` (✓ điểm tốt) and ``errors`` (× cần sửa)
+   * as separate prose fields — we split each on newlines / bullets so the
+   * review renders them as Word-style annotation lines below the student
+   * work, like a printed teacher's mark-up. Falls back to the overall
+   * ``aiComment.body`` when both are empty (legacy responses without
+   * structured feedback).
+   */
+  feedback?: PerQuestionFeedback;
+}
+
+// Split a chunk of prose into individual annotation lines. Handles the
+// most common shapes the prompt emits: explicit newlines, dashes/bullets,
+// numbered lists, semicolons. Strips list-marker prefixes so the rendered
+// row can prepend its own ✓ / × glyph without duplicate symbols.
+function splitAnnotationLines(text: string | null | undefined): string[] {
+  const raw = String(text || "").trim();
+  if (!raw) return [];
+  // First split on newlines, then on " · " or "; " when single-line. This
+  // covers both the "one bullet per line" and "comma-separated note"
+  // styles that show up in Gemini outputs.
+  let parts = raw.split(/\r?\n+/).map((s) => s.trim()).filter(Boolean);
+  if (parts.length === 1 && /[;·]/.test(parts[0])) {
+    parts = parts[0].split(/\s*[;·]\s*/).filter(Boolean);
+  }
+  return parts.map((line) =>
+    line
+      // Strip common bullet markers so the glyph in the row template is
+      // the only visual prefix.
+      .replace(/^[-•·*+]+\s*/, "")
+      .replace(/^\d+[.)]\s*/, "")
+      .replace(/^[✓✔×✗]\s*/, "")
+      .trim(),
+  ).filter(Boolean);
 }
 
 function QuestionBox({
@@ -499,30 +506,1141 @@ function QuestionBox({
   subject,
   isSalvaged,
   stacked,
+  feedback,
 }: QuestionBoxProps) {
-  const [expanded, setExpanded] = useState(true);
+  const [bodyExpanded, setBodyExpanded] = useState(true);
+  const [teacherOpen, setTeacherOpen] = useState(false);
+
+  // ``stacked`` no longer changes layout (the box is single-column now), so
+  // the prop is intentionally unread. Kept on the interface in case a
+  // future mobile-only behavior wants it; silenced for the linter.
+  void stacked;
+
+  // Parse the structured per-question feedback into ✓ / × annotation lines.
+  // When the structured fields are empty (older responses or salvaged
+  // outputs), fall back to splitting the freeform aiComment body on the
+  // first paragraph that looks like a strength list vs. an error list —
+  // crude but better than dropping the AI's signal entirely.
+  const goodLines = splitAnnotationLines(feedback?.good_points);
+  const errorLines = splitAnnotationLines(feedback?.errors);
+  const fallbackComment = aiComment.body?.trim() || "";
+  const hasAnnotations = goodLines.length > 0 || errorLines.length > 0;
+  const showFallback = !hasAnnotations && !!fallbackComment;
+
+  return (
+    // Word-style document page. Each câu renders as a paper card:
+    //   1. header with circle number + label
+    //   2. student work in mono (the proof / answer)
+    //   3. AI annotations rendered inline as ✓ điểm tốt / × cần sửa lines,
+    //      always visible (no toggle) — mirrors a teacher's red-pen markup
+    //      on a printed exam
+    //   4. teacher reply box, collapsed by default behind a "Thêm nhận
+    //      xét" link to keep the page clean until needed
+    <div
+      style={{
+        marginBottom: 16,
+        border: `1px solid ${T.border}`,
+        borderRadius: 14,
+        boxShadow: T.shadowSoft,
+        background: T.paper,
+        overflow: "hidden",
+      }}
+    >
+      <div
+        style={{
+          padding: "18px 20px 0",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 12,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+          <div
+            style={{
+              width: 26,
+              height: 26,
+              flexShrink: 0,
+              borderRadius: "50%",
+              background: T.accentSoft,
+              border: `1.5px solid ${T.accent}`,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontSize: 12,
+              fontWeight: 700,
+              color: T.accent,
+              fontFamily: T.mono,
+            }}
+          >
+            {questionIdx + 1}
+          </div>
+          <span
+            style={{
+              fontSize: 14,
+              fontWeight: 700,
+              color: T.accent,
+              textTransform: "uppercase",
+              letterSpacing: "0.06em",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {studentAnswer.label || `Câu ${questionIdx + 1}`}
+          </span>
+        </div>
+
+        <button
+          onClick={() => setBodyExpanded((v) => !v)}
+          aria-label={bodyExpanded ? "Thu gọn bài làm" : "Mở bài làm"}
+          title={bodyExpanded ? "Thu gọn" : "Mở"}
+          style={{
+            background: "none",
+            border: "none",
+            cursor: "pointer",
+            color: T.textFaint,
+            padding: 4,
+            display: "flex",
+            alignItems: "center",
+            flexShrink: 0,
+          }}
+        >
+          {bodyExpanded ? (
+            <Icon.ArrowDown size={14} color={T.textFaint} />
+          ) : (
+            <Icon.ChevronRight size={14} color={T.textFaint} />
+          )}
+        </button>
+      </div>
+
+      {bodyExpanded && (
+        <div
+          style={{
+            padding: "12px 20px 0",
+            fontSize: 14.5,
+            color: T.textSoft,
+            lineHeight: 1.7,
+            fontFamily: T.mono,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+            tabSize: 4,
+          }}
+        >
+          {formatTranscript(studentAnswer.body, subject)}
+        </div>
+      )}
+
+      {/* Inline AI annotations — ✓ good points and × errors, always
+          visible. Each line gets its own row with the glyph + tinted text
+          so the teacher can skim the AI's marks like a margin note. */}
+      {bodyExpanded && (hasAnnotations || showFallback || isSalvaged) && (
+        <div
+          style={{
+            margin: "14px 20px 0",
+            padding: "10px 14px",
+            background: T.bgCard,
+            border: `1px solid ${T.borderLight}`,
+            borderRadius: 8,
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+          }}
+        >
+          {goodLines.map((line, i) => (
+            <AnnotationRow key={`g-${i}`} kind="good" text={line} />
+          ))}
+          {errorLines.map((line, i) => (
+            <AnnotationRow key={`e-${i}`} kind="error" text={line} />
+          ))}
+          {showFallback && (
+            // Legacy / unstructured response — emit the freeform comment
+            // as a single neutral row so we don't drop the AI signal.
+            <AnnotationRow kind="note" text={fallbackComment} />
+          )}
+          {!hasAnnotations && !showFallback && isSalvaged && (
+            <AnnotationRow
+              kind="warn"
+              text={String(
+                t.noCommentSalvaged ??
+                  "Phản hồi cho câu này bị cắt — hãy đối chiếu bài làm hoặc chấm lại.",
+              )}
+            />
+          )}
+        </div>
+      )}
+
+      {/* Teacher reply — folded behind a thin link by default so the page
+          stays focused on the AI's mark-up. Click "Thêm nhận xét" to
+          reveal the textarea + thread. Once any teacher message exists,
+          we auto-open so prior threads aren't hidden mid-conversation. */}
+      {bodyExpanded && (
+        <div style={{ padding: "14px 20px 18px" }}>
+          {(teacherOpen || comments.length > 0) ? (
+            <>
+              <div
+                style={{
+                  fontSize: 12,
+                  fontWeight: 600,
+                  color: T.textMute,
+                  textTransform: "uppercase",
+                  letterSpacing: "0.08em",
+                  marginBottom: 6,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 5,
+                }}
+              >
+                <Icon.Edit size={11} color={T.textFaint} />
+                {String(t.teacherNote ?? "Nhận xét giáo viên")}
+              </div>
+              <CommentThread
+                comments={comments}
+                onSend={onSendComment}
+                onDisputeDecide={onDisputeDecide}
+                isLoading={isAnalyzing}
+                t={t}
+              />
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setTeacherOpen(true)}
+              style={{
+                background: "transparent",
+                border: "none",
+                padding: 0,
+                cursor: "pointer",
+                color: T.textMute,
+                fontFamily: T.font,
+                fontSize: 13,
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 4,
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.color = T.accent)}
+              onMouseLeave={(e) => (e.currentTarget.style.color = T.textMute)}
+            >
+              <Icon.Edit size={11} />
+              Thêm nhận xét cho câu này
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// One row of inline AI markup — ✓ điểm tốt (green), × cần sửa (red),
+// or a neutral fallback for unstructured prose / salvage warnings.
+// Mirrors a teacher's red-pen mark on a printed exam: glyph + italic
+// short phrase, sitting just under the body it refers to.
+function AnnotationRow({
+  kind,
+  text,
+}: {
+  kind: "good" | "error" | "note" | "warn";
+  text: string;
+}) {
+  const palette: Record<typeof kind, { color: string; glyph: string; weight: number }> = {
+    good:  { color: T.green, glyph: "✓", weight: 600 },
+    error: { color: T.red,   glyph: "×", weight: 600 },
+    note:  { color: T.textSoft, glyph: "•", weight: 500 },
+    warn:  { color: T.amber, glyph: "⚠", weight: 600 },
+  };
+  const p = palette[kind];
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "flex-start",
+        gap: 8,
+        fontSize: 13.5,
+        lineHeight: 1.55,
+        color: T.textSoft,
+        fontStyle: "italic",
+      }}
+    >
+      <span
+        aria-hidden="true"
+        style={{
+          color: p.color,
+          fontWeight: p.weight,
+          fontFamily: T.mono,
+          fontStyle: "normal",
+          flexShrink: 0,
+          minWidth: 12,
+          textAlign: "center",
+          lineHeight: 1.55,
+        }}
+      >
+        {p.glyph}
+      </span>
+      <span style={{ color: p.color, fontWeight: 500 }}>{text}</span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ReviewMockup — UI-first visual design (hardcoded sample data).
+//
+// Matches the reference Trần Minh Khôi mockup the teacher locked: header
+// strip with student identity + AI run metadata, a left "document" column
+// with a peach-tinted card per câu showing inline ✓ / × annotations next
+// to the lines they refer to and a red italic score footer, and a right
+// sticky summary panel with the overall estimated grade plus per-câu
+// score cards (one highlighted as the active câu). Pure presentational —
+// no props from real grade state yet. Wiring comes after sign-off.
+// ---------------------------------------------------------------------------
+
+// Schema mirrors the reference prototype's MOCK_AI_GRADE.byQuestion shape:
+// student work is a flat string[], annotations live in a separate array and
+// reference their target line by index. Keeps the data minimal and lets the
+// renderer place ✓ / × glyphs inline with whatever line they describe.
+interface MockAnnotation {
+  /** Zero-based index into the parent question's ``lines`` array. */
+  line: number;
+  kind: "good" | "error";
+  text: string;
+}
+
+interface MockQuestion {
+  num: number;
+  earned: number;
+  max: number;
+  /** Short rubric note shown in the right-side "TỪNG CÂU" summary card. */
+  summary: string;
+  /** Raw student work, one entry per visual line. Whitespace is preserved
+   *  so indented continuation lines line up under their parent expression. */
+  lines: string[];
+  annotations: MockAnnotation[];
+}
+
+interface MockReferencedLesson {
+  id: string;
+  subject: string;
+  score: number;
+  text: string;
+  similarity: number;
+  date: string;
+}
+
+const MOCK_REVIEW = {
+  studentName: "Trần Minh Khôi",
+  studentClass: "Lớp 10A1",
+  runNumber: 1,
+  lessonsUsed: 3,
+  modelName: "gemini-3-flash-preview",
+  durationSec: 4.8,
+  overallScore: 8.5,
+  overallMax: 10.0,
+  correctCount: 1,
+  needsReviewCount: 2,
+  /** Default focus on mount — Câu 1 mirrors the reference screenshot. */
+  initialActiveQuestionNum: 1,
+  referencedLessons: [
+    {
+      id: "L-0247",
+      subject: "Toán",
+      score: 4.0,
+      text: "Khi học sinh giải pt bậc hai bằng Δ, không trừ điểm vì thiếu khẳng định a ≠ 0 nếu hệ số đã hiển nhiên bằng 1.",
+      similarity: 0.91,
+      date: "2026-04-22",
+    },
+    {
+      id: "L-0193",
+      subject: "Toán",
+      score: 3.5,
+      text: "Với câu hỏi 'tìm m để có 2 nghiệm phân biệt', cần kết luận miền m, KHÔNG chỉ ghi bất phương trình kết quả.",
+      similarity: 0.88,
+      date: "2026-04-15",
+    },
+    {
+      id: "L-0166",
+      subject: "Toán",
+      score: 3.0,
+      text: "Vi-ét chỉ áp dụng được khi pt có nghiệm (Δ ≥ 0). Bài đề cho biết đã có 2 nghiệm thì không cần nhắc lại điều kiện.",
+      similarity: 0.74,
+      date: "2026-03-30",
+    },
+  ] as MockReferencedLesson[],
+  questions: [
+    {
+      num: 1,
+      earned: 3.0,
+      max: 3.0,
+      summary: "Trình bày đầy đủ, tính Δ và nghiệm chính xác.",
+      lines: [
+        "Câu 1.",
+        "x² - 5x + 6 = 0",
+        "Δ = 25 - 24 = 1",
+        "x = (5 ± 1) / 2",
+        "→ x = 3  hoặc  x = 2",
+        "Vậy phương trình có hai nghiệm  x = 2, x = 3.",
+      ],
+      annotations: [
+        { line: 1, kind: "good", text: "Tính Δ đúng" },
+        { line: 4, kind: "good", text: "Kết luận đầy đủ" },
+      ],
+    },
+    {
+      num: 2,
+      earned: 3.0,
+      max: 4.0,
+      summary: "Tính toán đúng nhưng chưa loại trừ điều kiện a ≠ 0 và chưa nói rõ pt bậc hai.",
+      lines: [
+        "Câu 2.",
+        "Để pt có 2 nghiệm phân biệt → Δ' > 0",
+        "Δ' = (m+1)² - (m² - 3)",
+        "    = m² + 2m + 1 - m² + 3",
+        "    = 2m + 4",
+        "2m + 4 > 0  →  m > -2",
+        "Vậy m > -2 thì pt có 2 nghiệm phân biệt.",
+      ],
+      annotations: [
+        { line: 1, kind: "error", text: "Thiếu khẳng định a = 1 ≠ 0 (pt bậc hai)" },
+        { line: 5, kind: "good", text: "Biến đổi đúng" },
+        { line: 6, kind: "error", text: "Cần KẾT LUẬN miền m ⇒ trừ 0.5đ" },
+      ],
+    },
+    {
+      num: 3,
+      earned: 2.5,
+      max: 3.0,
+      summary: "Dùng Vi-ét hợp lý, nhưng cần ghi rõ điều kiện áp dụng và thử lại.",
+      lines: [
+        "Câu 3.",
+        "Theo Vi-ét:",
+        "x₁ + x₂ = -b   →   2 + (-5) = -b   →   b = 3",
+        "x₁ · x₂ = c     →   2 · (-5) = c     →   c = -10",
+        "Vậy b = 3, c = -10.",
+      ],
+      annotations: [
+        { line: 2, kind: "error", text: "Thiếu điều kiện Δ ≥ 0 để áp dụng Vi-ét" },
+        { line: 3, kind: "good", text: "Tính b đúng" },
+        { line: 4, kind: "good", text: "Tính c đúng" },
+      ],
+    },
+  ] as MockQuestion[],
+};
+
+/** Build the review payload (MOCK_REVIEW shape) from a live grade +
+ *  pipeline state. Falls through to MOCK_REVIEW when the grade has no
+ *  scored per-câu data, so dev runs and salvaged grades still render.
+ *
+ *  Fields still mocked (no source yet):
+ *    - studentName / studentClass — no upload-form field for them.
+ *    - durationSec — pipeline doesn't measure VLM call time yet.
+ *    - similarity — backend doesn't expose semantic-distance per lesson.
+ *  When those sources land, replace the placeholders here without
+ *  changing the layout. */
+function deriveStepReviewData(
+  grade: Grade | null,
+  lessonsUsed: Lesson[],
+  runNumber: number,
+): typeof MOCK_REVIEW {
+  const pqf = grade?.per_question_feedback ?? [];
+  const hasReal =
+    pqf.length > 0 && pqf.some((q) => typeof q.score === "number");
+  if (!hasReal) return MOCK_REVIEW;
+
+  const linesByCau = splitTranscriptByCau(grade?.transcript ?? "");
+  const questions: MockQuestion[] = pqf.map((q, i) => {
+    const parsed = parseCauHeader(q.question ?? "", i + 1);
+    const lines = linesByCau.get(parsed.num) ?? [];
+    const max =
+      typeof q.max_points === "number" && isFinite(q.max_points)
+        ? q.max_points
+        : 0;
+    const earned =
+      typeof q.score === "number" && isFinite(q.score) ? q.score : 0;
+    return {
+      num: parsed.num,
+      earned,
+      max,
+      summary: q.good_points || q.errors || parsed.prompt || "",
+      lines: lines.length > 0 ? lines : [`Câu ${parsed.num}.`],
+      annotations: buildSyntheticAnnotations(q, lines.length),
+    };
+  });
+
+  const overallMax = questions.reduce((s, q) => s + q.max, 0) || 10;
+  const correctCount = questions.filter(
+    (q) => q.max > 0 && Math.abs(q.earned - q.max) < 0.001,
+  ).length;
+  const needsReviewCount = questions.length - correctCount;
+
+  const referencedLessons: MockReferencedLesson[] = lessonsUsed.map((l) => ({
+    id: `L-${String(l.id).padStart(4, "0")}`,
+    subject: l.subject || "—",
+    score: l.feedback_score,
+    text: l.lesson_text,
+    similarity: 0, // Backend doesn't expose semantic distance yet.
+    date: l.timestamp ? l.timestamp.slice(0, 10) : "—",
+  }));
+
+  return {
+    studentName: MOCK_REVIEW.studentName, // No upload-form field yet.
+    studentClass: MOCK_REVIEW.studentClass,
+    runNumber,
+    lessonsUsed: lessonsUsed.length,
+    modelName: "gemini-3-flash-preview",
+    durationSec: 0, // Not measured by pipeline yet.
+    overallScore: typeof grade?.overall === "number" ? grade.overall : 0,
+    overallMax,
+    correctCount,
+    needsReviewCount,
+    initialActiveQuestionNum: questions[0]?.num ?? 1,
+    referencedLessons,
+    questions,
+  };
+}
+
+function ReviewMockup({
+  isMobile,
+  review = MOCK_REVIEW,
+}: {
+  isMobile: boolean;
+  /** Derived review payload from grade + pipeline. When omitted we keep
+   *  the legacy MOCK_REVIEW so design iteration / Storybook-style use
+   *  still works without a real backend call. */
+  review?: typeof MOCK_REVIEW;
+}) {
+  // Active câu drives BOTH the paper highlight (peach behind the q-block)
+  // and the rail's selected qcard border. Click on either side updates
+  // this state — the two panels mirror each other.
+  const [activeQ, setActiveQ] = useState<number>(review.initialActiveQuestionNum);
+  return (
+    <div
+      style={{
+        display: isMobile ? "block" : "grid",
+        gridTemplateColumns: isMobile ? undefined : "minmax(0, 1fr) 380px",
+        gap: 18,
+        alignItems: "start",
+      }}
+    >
+      <PaperContainer
+        review={review}
+        activeQ={activeQ}
+        setActiveQ={setActiveQ}
+      />
+      <Rail
+        review={review}
+        activeQ={activeQ}
+        setActiveQ={setActiveQ}
+        isMobile={isMobile}
+      />
+    </div>
+  );
+}
+
+// PaperHead — title section INSIDE the paper card. Mirrors the reference's
+// ``.paper-head`` (slightly elevated bg, bottom border separator) so the
+// student identity reads as the document's title, not as a floating header
+// disconnected from the body. Eyebrow → student name on the left, lessons
+// pill + model/time on the right.
+function PaperHead({ review }: { review: typeof MOCK_REVIEW }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        gap: 16,
+        padding: "14px 20px",
+        background: T.bgElevated,
+        borderBottom: `1px solid ${T.border}`,
+        flexWrap: "wrap",
+      }}
+    >
+      <div style={{ minWidth: 0 }}>
+        <div
+          style={{
+            fontSize: 11,
+            fontWeight: 700,
+            color: T.textFaint,
+            letterSpacing: "0.12em",
+            textTransform: "uppercase",
+            marginBottom: 4,
+          }}
+        >
+          Bản chấm AI · Lần {review.runNumber}
+        </div>
+        <div
+          style={{
+            // Reference uses body serif, not the display Fraunces. Keep
+            // weight at 600 so the student identity reads as the page's
+            // subject without competing with the right-column big score.
+            fontFamily: T.font,
+            fontSize: 18,
+            fontWeight: 600,
+            color: T.text,
+            letterSpacing: "-0.005em",
+            lineHeight: 1.25,
+          }}
+        >
+          {review.studentName} · {review.studentClass}
+        </div>
+      </div>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          flexShrink: 0,
+          flexWrap: "wrap",
+          justifyContent: "flex-end",
+        }}
+      >
+        {/* Two pills side-by-side — share the exact same MetaPill style so
+            they line up at the same height + corner radius. The lessons
+            pill is informational (span), the PDF one is an action (button
+            with hover). The visual treatment otherwise has to be identical
+            or the row looks lopsided. */}
+        <MetaPill
+          icon={<Icon.Lightbulb size={11} color={T.amber} />}
+          title={`AI: ${review.modelName} · ${review.durationSec}s`}
+        >
+          {review.lessonsUsed} lessons dùng
+        </MetaPill>
+        <MetaPill
+          icon={<Icon.FileText size={11} />}
+          title="Mở bài làm gốc để đối chiếu với phần AI đã chép"
+          onClick={() => {
+            // Mockup phase — wired to real essayImage + modal once the
+            // visual design is locked. For now surface an explicit hint
+            // so a teacher clicking during a demo isn't confused.
+            window.alert(
+              "Mockup: nút này sẽ mở PDF gốc (hoặc ảnh chụp) bài làm học sinh khi được wire với backend.",
+            );
+          }}
+        >
+          Xem PDF gốc
+        </MetaPill>
+      </div>
+    </div>
+  );
+}
+
+// MetaPill — shared visual primitive for the two pills in the paper-head
+// (lessons-used badge + Xem PDF gốc action). Centralized so a span and a
+// button render at pixel-identical height / padding / radius, and the row
+// reads as a unified cluster instead of two slightly-misaligned chips.
+// Behavior differs by ``onClick`` presence: no-op pills render as <span>,
+// actionable pills render as <button> with hover-to-accent.
+function MetaPill({
+  children,
+  icon,
+  title,
+  onClick,
+}: {
+  children: React.ReactNode;
+  icon?: React.ReactNode;
+  title?: string;
+  onClick?: () => void;
+}) {
+  const baseStyle: React.CSSProperties = {
+    padding: "4px 10px",
+    background: T.bgCard,
+    border: `1px solid ${T.border}`,
+    borderRadius: 999,
+    fontSize: 12,
+    fontFamily: T.font,
+    fontWeight: 400,
+    lineHeight: 1.45,
+    color: T.textSoft,
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 5,
+    // ``margin: 0`` overrides the button user-agent margin on Safari/Firefox
+    // so the two pills sit at the exact same baseline.
+    margin: 0,
+  };
+  if (!onClick) {
+    return (
+      <span style={baseStyle} title={title}>
+        {icon}
+        {children}
+      </span>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      style={{
+        ...baseStyle,
+        cursor: "pointer",
+        transition: "color 0.12s, border-color 0.12s",
+      }}
+      onMouseEnter={(e) => {
+        e.currentTarget.style.color = T.accent;
+        e.currentTarget.style.borderColor = T.accent;
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.color = T.textSoft;
+        e.currentTarget.style.borderColor = T.border;
+      }}
+    >
+      {icon}
+      {children}
+    </button>
+  );
+}
+
+// Common eyebrow label for rail sections ("TỔNG QUAN AI", "TỪNG CÂU",
+// "BÀI HỌC AI ĐÃ THAM CHIẾU"). Centralized so all three keep the same
+// tracked-uppercase treatment. Inline content (right-aligned counter,
+// icon prefix) is composed via the optional `right` and `icon` slots.
+function RailEyebrow({
+  children,
+  right,
+  icon,
+}: {
+  children: React.ReactNode;
+  right?: React.ReactNode;
+  icon?: React.ReactNode;
+}) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 8,
+        marginBottom: 10,
+      }}
+    >
+      <div
+        style={{
+          fontSize: 11,
+          fontWeight: 700,
+          color: T.textFaint,
+          letterSpacing: "0.12em",
+          textTransform: "uppercase",
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 6,
+        }}
+      >
+        {icon}
+        {children}
+      </div>
+      {right && (
+        <span style={{ fontSize: 11, color: T.textMute, fontFamily: T.mono }}>
+          {right}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// PaperContainer — single "sheet of paper" wrapping every câu. Matches the
+// reference's ``.paper`` card: one bordered surface with a head section
+// (student identity + AI run meta) and a body section (annotated answer).
+// q-blocks separated by spacing alone — no per-câu cards. Clicking inside
+// a q-block sets that câu as active (peach tint follows the click); the
+// rail mirrors the same state in its qcards.
+function PaperContainer({
+  review,
+  activeQ,
+  setActiveQ,
+}: {
+  review: typeof MOCK_REVIEW;
+  activeQ: number;
+  setActiveQ: (n: number) => void;
+}) {
+  return (
+    <div
+      style={{
+        background: T.paper,
+        border: `1px solid ${T.border}`,
+        borderRadius: 12,
+        boxShadow: T.shadowSoft,
+        minWidth: 0,
+        // overflow:hidden keeps the elevated paper-head bg clipped to the
+        // outer rounded corners — without it the head bleeds past the radius.
+        overflow: "hidden",
+      }}
+    >
+      <PaperHead review={review} />
+      <div style={{ padding: "16px 20px 4px" }}>
+        <AnnotatedAnswer
+          questions={review.questions}
+          activeQ={activeQ}
+          setActiveQ={setActiveQ}
+        />
+      </div>
+    </div>
+  );
+}
+
+// AnnotatedAnswer — student work rendered as a single mono stream, with
+// AI ✓ / × notes attached to whichever line they describe. Mirrors the
+// reference's ``AnnotatedAnswer``: each q-block is clickable and the
+// active one gets a peach background; annotations are matched to lines
+// by index, NOT inlined into the source data — keeps the line text clean.
+function AnnotatedAnswer({
+  questions,
+  activeQ,
+  setActiveQ,
+}: {
+  questions: MockQuestion[];
+  activeQ: number;
+  setActiveQ: (n: number) => void;
+}) {
+  return (
+    <div
+      style={{
+        fontFamily: T.mono,
+        fontSize: 14.5,
+        color: T.textSoft,
+        lineHeight: 1.85,
+      }}
+    >
+      {questions.map((q) => {
+        const active = q.num === activeQ;
+        return (
+          <div
+            key={q.num}
+            onClick={() => setActiveQ(q.num)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                setActiveQ(q.num);
+              }
+            }}
+            role="button"
+            tabIndex={0}
+            aria-pressed={active}
+            style={{
+              cursor: "pointer",
+              padding: "14px 16px",
+              // Negative side margins let the active highlight reach the
+              // paper's inner padding edge so the peach band feels like a
+              // proper section, not a chip floating in the middle.
+              margin: "0 -16px 18px",
+              borderRadius: 8,
+              background: active ? "#FBEEEA" : "transparent",
+              transition: "background 0.15s",
+              outline: "none",
+            }}
+          >
+            {q.lines.map((line, i) => {
+              const ann = q.annotations.find((a) => a.line === i);
+              return (
+                <div
+                  key={i}
+                  style={{
+                    display: "flex",
+                    alignItems: "baseline",
+                    gap: 14,
+                    flexWrap: "wrap",
+                    // pre-wrap (not pre): keeps leading-space indentation for
+                    // multi-line math steps AND wraps long prose lines like
+                    // ``[Hình vẽ: …]`` instead of letting them run off the
+                    // paper edge. Geometry transcripts mix both shapes so we
+                    // need the hybrid.
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                    minWidth: 0,
+                  }}
+                >
+                  <span style={{ minWidth: 0, maxWidth: "100%" }}>{line}</span>
+                  {ann && (
+                    <span
+                      style={{
+                        color: T.red,
+                        fontStyle: "italic",
+                        fontFamily: T.font,
+                        fontSize: 13.5,
+                        fontWeight: 500,
+                        // Annotation re-enables normal wrapping so it
+                        // doesn't push the row width past the column.
+                        whiteSpace: "normal",
+                      }}
+                    >
+                      {ann.kind === "good" ? "✓" : "×"} {ann.text}
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+            <div
+              style={{
+                marginTop: 10,
+                color: T.red,
+                fontStyle: "italic",
+                fontFamily: T.font,
+                fontSize: 14,
+              }}
+            >
+              — {q.earned.toFixed(1)}/{q.max.toFixed(1)}đ
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Rail — right-side summary card. Sticky + internally scrollable so the
+// "Tổng quan / Từng câu / Bài học tham chiếu" stack stays in view while
+// the teacher scrolls the long student work in the paper next to it.
+function Rail({
+  review,
+  activeQ,
+  setActiveQ,
+  isMobile,
+}: {
+  review: typeof MOCK_REVIEW;
+  activeQ: number;
+  setActiveQ: (n: number) => void;
+  isMobile: boolean;
+}) {
+  return (
+    <aside
+      style={{
+        background: T.bgCard,
+        border: `1px solid ${T.border}`,
+        borderRadius: 12,
+        boxShadow: T.shadowSoft,
+        display: "flex",
+        flexDirection: "column",
+        // Sticky inside a grid item requires alignSelf:start, otherwise the
+        // grid stretches the rail to the row's full height and sticky has
+        // no slack to slide along.
+        position: isMobile ? "static" : "sticky",
+        top: 16,
+        alignSelf: "start",
+        maxHeight: isMobile ? "none" : "calc(100vh - 32px)",
+        overflow: "hidden",
+      }}
+    >
+      <div
+        style={{
+          padding: "14px 18px",
+          borderBottom: `1px solid ${T.borderLight}`,
+          flexShrink: 0,
+        }}
+      >
+        <div
+          style={{
+            fontSize: 11,
+            fontWeight: 700,
+            color: T.textFaint,
+            letterSpacing: "0.12em",
+            textTransform: "uppercase",
+          }}
+        >
+          Tổng quan AI
+        </div>
+      </div>
+      <div
+        style={{
+          padding: "16px 18px",
+          overflowY: "auto",
+          flex: 1,
+          display: "flex",
+          flexDirection: "column",
+          gap: 18,
+        }}
+      >
+        <OverallCard review={review} />
+        <PerQuestionList
+          questions={review.questions}
+          activeQ={activeQ}
+          setActiveQ={setActiveQ}
+        />
+        <LessonsList lessons={review.referencedLessons} />
+      </div>
+    </aside>
+  );
+}
+
+function OverallCard({ review }: { review: typeof MOCK_REVIEW }) {
+  return (
+    <div
+      style={{
+        background: T.bgMuted,
+        border: `1px solid ${T.borderLight}`,
+        borderRadius: 10,
+        padding: "14px 16px",
+      }}
+    >
+      {/* "điểm dự kiến" eyebrow removed — the section header "Tổng quan
+          AI" above + the big 8.5 / 10.0 already say what this number is.
+          The extra label was just panel noise for long essays. */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "baseline",
+          gap: 6,
+          flexWrap: "wrap",
+        }}
+      >
+        <span
+          style={{
+            fontFamily: T.mono,
+            fontSize: 38,
+            fontWeight: 600,
+            color: T.text,
+            letterSpacing: "-0.02em",
+            lineHeight: 1,
+          }}
+        >
+          {review.overallScore.toFixed(1)}
+        </span>
+        <span style={{ fontSize: 16, color: T.textMute, fontFamily: T.mono }}>
+          / {review.overallMax.toFixed(1)}
+        </span>
+      </div>
+      <div
+        style={{
+          marginTop: 8,
+          fontSize: 12.5,
+          color: T.textSoft,
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          flexWrap: "wrap",
+        }}
+      >
+        <span style={{ color: T.green, fontWeight: 600 }}>
+          {review.correctCount} đúng
+        </span>
+        <span style={{ color: T.textFaint }}>·</span>
+        <span style={{ color: T.red, fontWeight: 600 }}>
+          {review.needsReviewCount} cần xem
+        </span>
+        <span style={{ color: T.textFaint }}>·</span>
+        <span style={{ fontFamily: T.mono, color: T.textMute }}>
+          {review.durationSec.toFixed(2)}s
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function PerQuestionList({
+  questions,
+  activeQ,
+  setActiveQ,
+}: {
+  questions: MockQuestion[];
+  activeQ: number;
+  setActiveQ: (n: number) => void;
+}) {
+  return (
+    <div>
+      <RailEyebrow>Từng câu</RailEyebrow>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {questions.map((q) => (
+          <RailQCard
+            key={q.num}
+            q={q}
+            active={q.num === activeQ}
+            onClick={() => setActiveQ(q.num)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function RailQCard({
+  q,
+  active,
+  onClick,
+}: {
+  q: MockQuestion;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      style={{
+        textAlign: "left",
+        width: "100%",
+        background: active ? "#FBEEEA" : T.bgCard,
+        border: active ? `1.5px solid ${T.red}` : `1px solid ${T.border}`,
+        borderRadius: 10,
+        padding: "12px 14px",
+        cursor: "pointer",
+        transition: "border-color 0.15s, background 0.15s",
+        fontFamily: "inherit",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "baseline",
+          gap: 8,
+        }}
+      >
+        <span style={{ fontSize: 14, fontWeight: 600, color: T.text }}>
+          Câu {q.num}
+        </span>
+        <span style={{ fontFamily: T.mono, fontSize: 14 }}>
+          <span
+            style={{
+              fontWeight: 700,
+              color:
+                q.earned < q.max
+                  ? T.red
+                  : T.text,
+            }}
+          >
+            {q.earned.toFixed(1)}
+          </span>
+          <span style={{ color: T.textMute }}>/{q.max.toFixed(1)}</span>
+        </span>
+      </div>
+      <div
+        style={{
+          marginTop: 5,
+          fontSize: 12.5,
+          color: T.textSoft,
+          lineHeight: 1.5,
+        }}
+      >
+        {q.summary}
+      </div>
+    </button>
+  );
+}
+
+function LessonsList({ lessons }: { lessons: MockReferencedLesson[] }) {
+  // Default collapsed: long essays (8–10 câu) would push the panel scroll
+  // deep past these cards before the teacher could even see the per-câu
+  // list. The count itself ("3 kết quả") on the toggle still telegraphs
+  // that lessons exist — teacher clicks to inspect.
+  const [open, setOpen] = useState(false);
 
   return (
     <div
       style={{
-        display: "grid",
-        gridTemplateColumns: stacked ? "1fr" : "1fr 1fr",
-        gap: 0,
-        marginBottom: 16,
-        border: `1px solid ${T.border}`,
-        borderRadius: 14,
-        overflow: "hidden",
-        boxShadow: T.shadowSoft,
-        background: T.bgCard,
+        borderTop: `1px dashed ${T.border}`,
+        paddingTop: 14,
       }}
     >
-      {/* Left: Student Answer */}
-      <div
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
         style={{
-          borderRight: stacked ? "none" : `1px solid ${T.border}`,
-          borderBottom: stacked ? `1px solid ${T.border}` : "none",
-          padding: "18px 20px",
-          background: T.paper,
+          width: "100%",
+          background: "transparent",
+          border: "none",
+          padding: 0,
+          cursor: "pointer",
+          fontFamily: "inherit",
+          textAlign: "left",
         }}
       >
         <div
@@ -530,299 +1648,143 @@ function QuestionBox({
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
-            marginBottom: 12,
+            gap: 8,
+            marginBottom: open ? 10 : 0,
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <div
-              style={{
-                width: 26,
-                height: 26,
-                borderRadius: "50%",
-                background: T.accentSoft,
-                border: `1.5px solid ${T.accent}`,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                fontSize: 12,
-                fontWeight: 700,
-                color: T.accent,
-                fontFamily: T.mono,
-              }}
-            >
-              {questionIdx + 1}
-            </div>
-            <span
-              style={{
-                fontSize: 14,
-                fontWeight: 700,
-                color: T.accent,
-                textTransform: "uppercase",
-                letterSpacing: "0.06em",
-              }}
-            >
-              {studentAnswer.label || `Câu ${questionIdx + 1}`}
-            </span>
-          </div>
-          <button
-            onClick={() => setExpanded((v) => !v)}
-            style={{
-              background: "none",
-              border: "none",
-              cursor: "pointer",
-              color: T.textFaint,
-              padding: 2,
-              display: "flex",
-              alignItems: "center",
-            }}
-          >
-            {expanded ? (
-              <Icon.ArrowDown size={14} color={T.textFaint} />
-            ) : (
-              <Icon.ChevronRight size={14} color={T.textFaint} />
-            )}
-          </button>
-        </div>
-
-        {expanded && (
           <div
             style={{
-              fontSize: 14.5,
-              color: T.textSoft,
-              lineHeight: 1.7,
-              fontFamily: T.mono,
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
-              tabSize: 4,
+              fontSize: 11,
+              fontWeight: 700,
+              color: T.textFaint,
+              letterSpacing: "0.12em",
+              textTransform: "uppercase",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
             }}
           >
-            {formatTranscript(studentAnswer.body, subject)}
+            <Icon.Lightbulb size={11} color={T.amber} />
+            Bài học AI đã tham chiếu
           </div>
-        )}
-      </div>
-
-      {/* Right: AI Comment + Teacher Comments */}
-      <div
-        style={{
-          padding: "18px 20px",
-          display: "flex",
-          flexDirection: "column",
-        }}
-      >
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 6,
-            marginBottom: 8,
-          }}
-        >
-          <Icon.MessageCircle size={13} color={T.accentLight} />
+          {/* Right cluster: count + toggle affordance. Chevron lives on
+              the right because mixing it with the topic icon on the left
+              made the two icons (9px chevron + 11px lightbulb) read as
+              misaligned — Notion / Material accordions both keep the
+              toggle on the trailing edge. */}
           <span
             style={{
-              fontSize: 12,
-              fontWeight: 700,
-              color: T.accentLight,
-              textTransform: "uppercase",
-              letterSpacing: "0.1em",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 8,
+              fontSize: 11,
+              color: T.textMute,
+              fontFamily: T.mono,
             }}
           >
-            {String(t.aiComment ?? "Nhận xét AI")}
+            {lessons.length} kết quả
+            <span
+              aria-hidden="true"
+              style={{
+                display: "inline-flex",
+                color: T.textFaint,
+                transform: `rotate(${open ? 90 : 0}deg)`,
+                transition: "transform 0.15s",
+              }}
+            >
+              <svg
+                width={10}
+                height={10}
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={2}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M9 6l6 6-6 6" />
+              </svg>
+            </span>
           </span>
         </div>
-
-        {aiComment.body ? (
-          <div
-            className="md-prose"
-            dangerouslySetInnerHTML={{ __html: parseMarkdown(aiComment.body) }}
-            style={{
-              fontSize: 14,
-              color: T.textSoft,
-              lineHeight: 1.6,
-              padding: "8px 12px",
-              background: T.accentSoft,
-              borderLeft: `3px solid ${T.accentLight}`,
-              borderRadius: "0 8px 8px 0",
-              marginBottom: 10,
-            }}
-          />
-        ) : isSalvaged ? (
-          <div
-            style={{
-              padding: "8px 12px",
-              borderRadius: 8,
-              background: T.amberSoft,
-              borderLeft: `3px solid ${T.amber}`,
-              fontSize: 14,
-              color: T.textSoft,
-              lineHeight: 1.5,
-              marginBottom: 10,
-            }}
-          >
-            <Icon.AlertTriangle
-              size={12}
-              color={T.amber}
-              style={{ marginRight: 6, verticalAlign: "middle" }}
-            />
-            {String(
-              t.noCommentSalvaged ??
-                "Phản hồi cho câu này bị cắt — hãy đối chiếu bài làm hoặc chấm lại.",
-            )}
-          </div>
-        ) : (
-          <div
-            style={{
-              padding: "8px 12px",
-              borderRadius: 8,
-              background: T.greenSoft,
-              borderLeft: `3px solid ${T.green}`,
-              fontSize: 14,
-              color: T.textSoft,
-              lineHeight: 1.5,
-              marginBottom: 10,
-            }}
-          >
-            <Icon.Check
-              size={12}
-              color={T.green}
-              style={{ marginRight: 6, verticalAlign: "middle" }}
-            />
-            {String(t.noIssues ?? "Không có vấn đề cần báo cáo.")}
-          </div>
-        )}
-
-        <div style={{ marginTop: "auto" }}>
-          <div
-            style={{
-              fontSize: 12,
-              fontWeight: 600,
-              color: T.textMute,
-              textTransform: "uppercase",
-              letterSpacing: "0.08em",
-              marginBottom: 6,
-              display: "flex",
-              alignItems: "center",
-              gap: 5,
-            }}
-          >
-            <Icon.Edit size={11} color={T.textFaint} />
-            {String(t.teacherNote ?? "Nhận xét giáo viên")}
-          </div>
-          <CommentThread
-            comments={comments}
-            onSend={onSendComment}
-            onDisputeDecide={onDisputeDecide}
-            isLoading={isAnalyzing}
-            t={t}
-          />
+      </button>
+      {open && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {lessons.map((lesson) => (
+            <LessonItem key={lesson.id} lesson={lesson} />
+          ))}
         </div>
-      </div>
+      )}
     </div>
   );
 }
 
-// ---------------------------------------------------------------------------
-// OriginalImageModal
-// ---------------------------------------------------------------------------
-interface OriginalImageModalProps {
-  src: string | null;
-  isPdf: boolean;
-  onClose: () => void;
-  t: I18nStrings;
-}
-
-function OriginalImageModal({ src, isPdf, onClose, t }: OriginalImageModalProps) {
-  if (!src) return null;
+function LessonItem({ lesson }: { lesson: MockReferencedLesson }) {
   return (
     <div
-      onClick={onClose}
       style={{
-        position: "fixed",
-        inset: 0,
-        background: "rgba(0,0,0,0.78)",
-        zIndex: 1000,
+        background: T.bgMuted,
+        border: `1px solid ${T.borderLight}`,
+        borderRadius: 8,
+        padding: "10px 12px",
         display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: 24,
-        animation: "fadeUp 0.2s ease-out",
+        flexDirection: "column",
+        gap: 5,
       }}
     >
       <div
-        onClick={(e) => e.stopPropagation()}
         style={{
-          position: "relative",
-          width: isPdf ? "92vw" : "auto",
-          height: isPdf ? "92vh" : "auto",
-          maxWidth: "92vw",
-          maxHeight: "92vh",
-          background: T.paper,
-          borderRadius: 10,
-          overflow: "hidden",
-          boxShadow: "0 24px 60px rgba(0,0,0,0.5)",
+          display: "flex",
+          alignItems: "baseline",
+          justifyContent: "space-between",
+          gap: 8,
         }}
       >
-        <button
-          onClick={onClose}
+        <span
           style={{
-            position: "absolute",
-            top: 10,
-            right: 10,
-            width: 32,
-            height: 32,
-            borderRadius: "50%",
-            background: "rgba(0,0,0,0.55)",
-            border: "none",
-            color: "#fff",
-            cursor: "pointer",
-            fontSize: 16,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            zIndex: 1,
+            fontFamily: T.mono,
+            fontSize: 11,
+            color: T.textMute,
           }}
-          title={String(t.close ?? "Đóng")}
         >
-          ×
-        </button>
-        {isPdf ? (
-          <object
-            data={src}
-            type="application/pdf"
-            style={{
-              display: "block",
-              width: "100%",
-              height: "100%",
-              background: "#fff",
-            }}
-          >
-            <iframe
-              src={src}
-              title={String(t.originalImage ?? "Bài làm gốc của học sinh")}
-              loading="eager"
-              style={{
-                display: "block",
-                width: "100%",
-                height: "100%",
-                border: "none",
-                background: "#fff",
-              }}
-            />
-          </object>
-        ) : (
-          <img
-            src={src}
-            alt={String(t.originalImage ?? "Bài làm gốc của học sinh")}
-            decoding="async"
-            loading="eager"
-            style={{
-              display: "block",
-              maxWidth: "92vw",
-              maxHeight: "92vh",
-              objectFit: "contain",
-            }}
-          />
+          {lesson.id} · {lesson.subject}
+        </span>
+        <span
+          style={{
+            fontFamily: T.mono,
+            fontSize: 11,
+            color: T.red,
+            fontWeight: 600,
+          }}
+        >
+          score {lesson.score.toFixed(1)}
+        </span>
+      </div>
+      <div
+        style={{
+          fontSize: 12.5,
+          color: T.textSoft,
+          lineHeight: 1.5,
+        }}
+      >
+        {lesson.text}
+      </div>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: lesson.similarity > 0 ? "space-between" : "flex-end",
+          fontFamily: T.mono,
+          fontSize: 10,
+          color: T.textFaint,
+        }}
+      >
+        {/* Backend doesn't expose semantic distance per lesson yet — when
+            similarity is 0 we hide the span rather than print "0%", which
+            would mislead the teacher into thinking the match was poor. */}
+        {lesson.similarity > 0 && (
+          <span>similarity {Math.round(lesson.similarity * 100)}%</span>
         )}
+        <span>{lesson.date}</span>
       </div>
     </div>
   );
@@ -835,7 +1797,18 @@ interface StepReviewProps {
   grade: Grade | null;
   pipeline: UseAgentPipelineResult;
   feedbackHook: UseFeedbackResult;
+  /** Legacy rubber-stamp callback. Kept on the props so the workspace
+   *  still wires it (for the eventual backend rewire of an "approve"
+   *  verdict). Currently no UI surfaces it — every grade now flows
+   *  through step 4 → step 5 finalize, and the approve semantics are
+   *  expected to be derived from "no scores changed" at step 5. */
   onApprove: () => void;
+  /** Primary forward action — go to step 4 (Chấm lại) for per-câu
+   *  review. */
+  onGoToRegrade?: () => void;
+  /** Back action — go to step 1 so the teacher can re-upload / swap
+   *  files. "Đọc lại" reads as "đọc lại đề + bài làm" in this flow. */
+  onPrev?: () => void;
   backendSubject: BackendSubject | null;
   task: string;
   t: I18nStrings;
@@ -847,6 +1820,8 @@ export function StepReview({
   pipeline,
   feedbackHook,
   onApprove,
+  onGoToRegrade,
+  onPrev,
   backendSubject,
   task,
   t,
@@ -855,34 +1830,10 @@ export function StepReview({
   const [commentThreads, setCommentThreads] = useState<CommentThreads>({});
   const [analyzingQ, setAnalyzingQ] = useState<number | null>(null);
   const [showOriginal, setShowOriginal] = useState(false);
-  const [essayBlobUrl, setEssayBlobUrl] = useState<string | null>(null);
   const isMobile = useIsMobile();
-
-  useEffect(() => {
-    const src = essayImage?.dataUrl;
-    if (!src) {
-      setEssayBlobUrl(null);
-      return undefined;
-    }
-    const match = /^data:([^;]+);base64,(.+)$/.exec(src);
-    if (!match) {
-      setEssayBlobUrl(src);
-      return undefined;
-    }
-    let url: string | null = null;
-    try {
-      const binary = atob(match[2]);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      url = URL.createObjectURL(new Blob([bytes], { type: match[1] }));
-      setEssayBlobUrl(url);
-    } catch {
-      setEssayBlobUrl(src);
-    }
-    return () => {
-      if (url) URL.revokeObjectURL(url);
-    };
-  }, [essayImage?.dataUrl]);
+  // dataUrl→blob conversion + revoke lifecycle now lives inside
+  // OriginalImageModal (shared with step 4) — caller just owns the
+  // open/close toggle.
 
   // IMPORTANT: hooks must be called before any conditional return. These
   // `useMemo`s used to live AFTER the `if (!grade) return null` check, which
@@ -949,6 +1900,22 @@ export function StepReview({
     [],
   );
 
+  // Derive the "Word-print" review payload from grade + pipeline state.
+  // useMemo so we don't re-build the questions array on every render
+  // when the active câu changes inside ReviewMockup. ``runCount`` from
+  // pipeline starts at 0 on first PIPELINE_SUCCESS, so +1 reads as
+  // "Lần 1" to the teacher. MUST live before the `if (!grade) return`
+  // early return — react-hooks/rules-of-hooks.
+  const reviewData = useMemo(
+    () =>
+      deriveStepReviewData(
+        grade,
+        pipeline.lessonsUsed,
+        pipeline.runCount + 1,
+      ),
+    [grade, pipeline.lessonsUsed, pipeline.runCount],
+  );
+
   if (!grade) return null;
 
   const questionCount = questionPairs.length;
@@ -1010,7 +1977,10 @@ export function StepReview({
         animation: "fadeUp 0.4s ease-out",
       }}
     >
-      {/* Top toolbar */}
+      {/* Top toolbar — horizontal padding matches the QuestionBox card's
+          internal padding (20 px) so the "Xem PDF gốc" button right-aligns
+          with the card's content right-edge, not the wider page maxWidth.
+          Stops the button from kissing the viewport edge on narrow windows. */}
       <div
         style={{
           display: "flex",
@@ -1019,6 +1989,7 @@ export function StepReview({
           gap: 8,
           marginBottom: 10,
           minHeight: 28,
+          padding: "0 20px",
         }}
       >
         {/* Left side intentionally empty — both meta-controls (lightbulb +
@@ -1113,14 +2084,12 @@ export function StepReview({
         </div>
       </div>
 
-      {showOriginal && (
-        <OriginalImageModal
-          src={essayBlobUrl}
-          isPdf={!!essayImage?.isPdf}
-          onClose={() => setShowOriginal(false)}
-          t={t}
-        />
-      )}
+      <OriginalImageModal
+        open={showOriginal}
+        essayImage={essayImage}
+        onClose={() => setShowOriginal(false)}
+        t={t}
+      />
 
       {isSalvaged && (
         <div
@@ -1151,132 +2120,149 @@ export function StepReview({
         </div>
       )}
 
-      {/* Column Headers — hidden in stacked mobile layout where each column
-          gets its own labelled section inside the QuestionBox. */}
-      <div
-        style={{
-          display: isMobile ? "none" : "grid",
-          gridTemplateColumns: "1fr 1fr",
-          marginBottom: 8,
-          padding: "0 4px",
-        }}
-      >
-        <span
-          style={{
-            fontSize: 12,
-            fontWeight: 700,
-            color: T.textFaint,
-            textTransform: "uppercase",
-            letterSpacing: "0.1em",
-          }}
-        >
-          {String(t.studentAnswer ?? "Câu trả lời học sinh")}
-        </span>
-        <span
-          style={{
-            fontSize: 12,
-            fontWeight: 700,
-            color: T.textFaint,
-            textTransform: "uppercase",
-            letterSpacing: "0.1em",
-          }}
-        >
-          {String(t.aiComment ?? "Nhận xét & Ghi chú")}
-        </span>
-      </div>
+      {/* "Word-print" review layout. The data is now derived from the
+          live grade + pipeline state — student-identity fields stay
+          mocked until the upload form gains them. Falls back to the
+          full mock when grade has no scored per-câu data (salvaged /
+          legacy) so the layout never breaks. The legacy QuestionBox +
+          questionPairs plumbing below is suspended via void-references
+          while we phase it out. */}
+      <ReviewMockup
+        isMobile={isMobile}
+        review={reviewData}
+      />
+      {/* Acknowledge the legacy plumbing as "intentionally suspended" so
+          the compiler doesn't complain about unused locals while we wait
+          for the design to be approved. These all come back once we wire
+          the mockup to real data. */}
+      {(() => {
+        void questionPairs;
+        void questionCount;
+        void commentThreads;
+        void analyzingQ;
+        void isSalvaged;
+        void subject;
+        void handleSendComment;
+        void handleDisputeDecide;
+        void QuestionBox;
+        return null;
+      })()}
 
-      {/* Per-Question Boxes */}
-      {questionCount === 0 ? (
+      {/* Bottom action bar — back / disclaimer / forward.
+          Approve shortcut intentionally removed: every grade now flows
+          through step 4 (Chấm lại) so the teacher engages per-câu before
+          committing. "Approve" semantics will be derived at step 5
+          finalize ("no scores changed" → approve verdict) when backend
+          is re-wired. The disclaimer text reminds the teacher of their
+          role in the HITL loop. */}
+      {feedbackHook.error && (
         <div
           style={{
+            marginTop: 16,
+            padding: "8px 12px",
+            background: T.redSoft,
+            borderRadius: 6,
+            fontSize: 14,
+            color: T.red,
             textAlign: "center",
-            padding: 40,
-            color: T.textFaint,
-            fontSize: 15,
-            fontStyle: "italic",
-            background: T.bgCard,
-            borderRadius: 12,
-            border: `1px solid ${T.border}`,
           }}
         >
-          {String(t.noContent ?? "Không có nội dung để hiển thị.")}
+          <Icon.AlertTriangle size={12} color={T.red} style={{ marginRight: 4 }} />
+          {feedbackHook.error}
         </div>
-      ) : (
-        questionPairs.map((pair, i) => (
-          <QuestionBox
-            key={pair.num}
-            studentAnswer={
-              pair.student.body || pair.student.label
-                ? pair.student
-                : { idx: i, label: `Câu ${pair.num}`, num: pair.num, body: "" }
-            }
-            aiComment={pair.ai}
-            questionIdx={i}
-            comments={commentThreads[i] || []}
-            onSendComment={(text) => handleSendComment(i, text)}
-            onDisputeDecide={(msgIdx, decision) => handleDisputeDecide(i, msgIdx, decision)}
-            isAnalyzing={analyzingQ === i}
-            t={t}
-            subject={subject}
-            isSalvaged={isSalvaged}
-            stacked={isMobile}
-          />
-        ))
       )}
-
-      {/* Approve Button */}
       <div
         style={{
           marginTop: 20,
           display: "flex",
-          flexDirection: "column",
           alignItems: "center",
-          gap: 8,
+          justifyContent: "space-between",
+          gap: 16,
+          flexWrap: "wrap",
         }}
       >
-        {feedbackHook.error && (
-          <div
-            style={{
-              padding: "8px 12px",
-              background: T.redSoft,
-              borderRadius: 6,
-              fontSize: 14,
-              color: T.red,
-              width: "100%",
-              maxWidth: 480,
-              textAlign: "center",
-            }}
-          >
-            <Icon.AlertTriangle size={12} color={T.red} style={{ marginRight: 4 }} />
-            {feedbackHook.error}
-          </div>
-        )}
         <button
-          onClick={handleApproveClick}
-          disabled={!canApprove}
+          onClick={onPrev}
+          disabled={!onPrev}
           style={{
-            padding: "14px 56px",
-            fontSize: 16,
-            color: canApprove ? "#fff" : T.textFaint,
-            background: canApprove ? T.green : T.bgElevated,
-            border: "none",
+            padding: "10px 18px",
+            fontSize: 14,
+            color: T.textSoft,
+            background: T.bgCard,
+            border: `1px solid ${T.border}`,
             borderRadius: 10,
-            cursor: canApprove ? "pointer" : "not-allowed",
-            transition: "all 0.2s",
-            display: "flex",
+            cursor: onPrev ? "pointer" : "not-allowed",
+            transition: "color 0.15s, border-color 0.15s",
+            fontWeight: 500,
+            display: "inline-flex",
             alignItems: "center",
-            gap: 8,
-            opacity: canApprove ? 1 : 0.5,
-            fontWeight: 600,
-            boxShadow: canApprove ? T.shadowSoft : "none",
+            gap: 6,
+            opacity: onPrev ? 1 : 0.5,
+          }}
+          onMouseEnter={(e) => {
+            if (!onPrev) return;
+            e.currentTarget.style.color = T.text;
+            e.currentTarget.style.borderColor = T.textMute;
+          }}
+          onMouseLeave={(e) => {
+            if (!onPrev) return;
+            e.currentTarget.style.color = T.textSoft;
+            e.currentTarget.style.borderColor = T.border;
           }}
         >
-          <Icon.Check size={16} color={canApprove ? "#fff" : T.textFaint} />
-          {feedbackHook.isSubmitting
-            ? String(t.feedbackSaving ?? "Đang lưu...")
-            : String(t.approveAndFinish ?? "Duyệt & Hoàn Thành")}
+          ← Đọc lại
+        </button>
+        <div
+          style={{
+            fontSize: 13,
+            color: T.textMute,
+            textAlign: "center",
+            flex: "1 1 200px",
+            minWidth: 0,
+          }}
+        >
+          Bạn là người chấm cuối. AI chỉ đề xuất.
+        </div>
+        <button
+          onClick={onGoToRegrade}
+          disabled={pipeline.phase === "generating" || !onGoToRegrade}
+          style={{
+            padding: "12px 22px",
+            fontSize: 14,
+            color: "#fff",
+            background: T.red,
+            border: "none",
+            borderRadius: 10,
+            cursor:
+              pipeline.phase === "generating" || !onGoToRegrade
+                ? "not-allowed"
+                : "pointer",
+            transition: "all 0.2s",
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            opacity:
+              pipeline.phase === "generating" || !onGoToRegrade ? 0.5 : 1,
+            fontWeight: 600,
+            boxShadow:
+              pipeline.phase === "generating" ? "none" : T.shadowSoft,
+            whiteSpace: "nowrap",
+          }}
+          title="Mở bảng chấm lại — sửa điểm từng câu, chat với AI về phần chưa chắc."
+        >
+          Chấm lại / Phản hồi
+          <Icon.ChevronRight size={14} color="#fff" />
         </button>
       </div>
+      {/* Suspend the approve plumbing we no longer render but want to
+          keep alive for the eventual backend rewire (mirrors the legacy
+          QuestionBox suspension a few hundred lines up). */}
+      {(() => {
+        void handleApproveClick;
+        void canApprove;
+        void onApprove;
+        return null;
+      })()}
     </div>
   );
 }

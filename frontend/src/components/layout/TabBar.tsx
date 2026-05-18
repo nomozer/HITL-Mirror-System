@@ -26,7 +26,7 @@ export function TabBar({
   return (
     <div
       style={{
-        padding: "10px clamp(16px, 4vw, 32px) 0",
+        padding: `${T.space[3]}px clamp(16px, 4vw, 32px) 0`,
         borderBottom: `1px solid ${T.border}`,
         background: T.bgCard,
       }}
@@ -56,14 +56,17 @@ export function TabBar({
               style={{
                 display: "flex",
                 alignItems: "center",
-                gap: 8,
-                padding: "10px 16px",
+                gap: T.space[2],
+                padding: `${T.space[3]}px ${T.space[4]}px`,
                 background: "transparent",
                 border: "none",
                 borderBottom: `2px solid ${isActive ? T.accent : "transparent"}`,
                 color: isActive ? T.text : T.textMute,
-                fontSize: 15,
-                transition: "all 0.2s",
+                fontSize: T.fontSize.sm,
+                // Listing exactly what changes on (de)activation — "all"
+                // would also animate any future layout property that gets
+                // added, causing per-frame reflows we don't want.
+                transition: "color 0.2s, border-bottom-color 0.2s",
                 whiteSpace: "nowrap",
               }}
             >
@@ -78,12 +81,32 @@ export function TabBar({
               />
               <span>{tab.label || `${String(t.essayN ?? "Essay")} ${i + 1}`}</span>
               {tabs.length > 1 && (
+                // Close affordance — kept as a <span role="button"> because
+                // nesting a real <button> inside the tab <button> is invalid
+                // HTML. ARIA role + tabIndex + keydown make it keyboard-
+                // reachable; stopPropagation prevents the outer tab from
+                // selecting itself when the user closes via Enter/Space.
                 <span
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Đóng ${tab.label || `${String(t.essayN ?? "Essay")} ${i + 1}`}`}
                   onClick={(e) => {
                     e.stopPropagation();
                     onClose(tab.id);
                   }}
-                  style={{ fontSize: 14, color: T.textFaint, padding: "0 2px" }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onClose(tab.id);
+                    }
+                  }}
+                  style={{
+                    fontSize: T.fontSize.sm,
+                    color: T.textFaint,
+                    padding: "0 2px",
+                    cursor: "pointer",
+                  }}
                 >
                   ×
                 </span>
@@ -95,11 +118,11 @@ export function TabBar({
         <button
           onClick={onAdd}
           style={{
-            padding: "10px 14px",
+            padding: `${T.space[3]}px ${T.space[4]}px`,
             background: "transparent",
             border: "none",
             color: T.textFaint,
-            fontSize: 14,
+            fontSize: T.fontSize.sm,
             transition: "color 0.2s",
             whiteSpace: "nowrap",
           }}
@@ -117,8 +140,8 @@ export function TabBar({
             background: "transparent",
             border: "none",
             color: T.textFaint,
-            fontSize: 13,
-            padding: "10px 4px",
+            fontSize: T.fontSize.xs,
+            padding: `${T.space[3]}px ${T.space[1]}px`,
             transition: "color 0.2s",
           }}
           onMouseEnter={(e) => (e.currentTarget.style.color = T.accent)}
