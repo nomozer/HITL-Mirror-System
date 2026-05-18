@@ -25,7 +25,11 @@ const PIPELINE_TIMEOUT_MS = 10 * 60 * 1000;
 // returned. Capped at 15 to keep localStorage well under its ~5 MB limit
 // (a typical response is ~5-15 KB without the essay image).
 const HISTORY_STORAGE_KEY = "hitl.gradeHistory";
-const HISTORY_MAX = 15;
+// 50 fits a 30-45 student class with a few re-grades and still leaves
+// localStorage well under the 5 MB cap (50 × ~15 KB ≈ 750 KB worst case).
+// Beyond this, search + recency grouping in the dropdown does the
+// findability work — a flat list of 50 was already painful at 15.
+const HISTORY_MAX = 50;
 
 export interface CachedGrade {
   /** Unique id — uses ``run_id`` from backend when available, falls back to

@@ -42,20 +42,65 @@ function relativeTime(ts: number): string {
   return new Date(ts).toLocaleDateString("vi-VN");
 }
 
-// Strip the "Môn X · Lớp Y · " prefix that buildTaskContext prepends so the
-// row label focuses on the essay's actual name (subject is shown separately
-// as a pill below). Falls back to the raw task if no prefix is found.
-function shortTaskLabel(task: string): string {
-  const m = task.match(/^Môn\s+\S+\s*·\s*Lớp\s+\d+\s*·\s*(.+)$/i);
-  return (m ? m[1] : task).trim() || "(không tên)";
+// Split the "Môn X · Lớp Y · <name>" prefix that buildTaskContext prepends
+// into structured pieces:
+//   body       = the essay's actual name (shown as the row title)
+//   classLabel = "Lớp 10" / "" (shown next to the subject pill)
+// Subject itself is read from entry.subject (the backend code), so we
+// only need to skip past it here. The subject segment can be multi-word
+// ("Sinh học", "Vật lý", "Hoá học") so we match ``[^·]+?`` instead of
+// ``\S+`` — the old single-token regex bailed on 2-word subjects and
+// left the entire "Môn ... · Lớp ... · ..." prefix in the title, where
+// it doubled up with the subject pill rendered right below.
+function parseTaskContext(task: string): { body: string; classLabel: string } {
+  const m = task.match(/^Môn\s+[^·]+?\s*·\s*(Lớp\s+\d+)\s*·\s*(.+)$/iu);
+  if (m) {
+    return { classLabel: m[1].trim(), body: m[2].trim() || "(không tên)" };
+  }
+  return { classLabel: "", body: (task || "").trim() || "(không tên)" };
+}
+
+// Recency buckets so a 30-50 row list still gives the teacher a temporal
+// anchor without a real timeline. Comparing day-boundaries (not wall
+// clock) so "chấm lúc 23:55 hôm qua" sits in "Hôm qua" even when read
+// at 00:05 today. ``getCachedGrades`` already returns newest-first, so
+// each bucket inherits that ordering.
+type Bucket = "today" | "yesterday" | "week" | "older";
+
+const BUCKET_LABEL: Record<Bucket, string> = {
+  today: "Hôm nay",
+  yesterday: "Hôm qua",
+  week: "7 ngày trước",
+  older: "Cũ hơn",
+};
+
+const BUCKET_ORDER: Bucket[] = ["today", "yesterday", "week", "older"];
+
+function startOfDay(ts: number): number {
+  const d = new Date(ts);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+}
+
+function bucketOf(ts: number): Bucket {
+  const dayDiff = Math.round((startOfDay(Date.now()) - startOfDay(ts)) / 86_400_000);
+  if (dayDiff <= 0) return "today";
+  if (dayDiff === 1) return "yesterday";
+  if (dayDiff <= 7) return "week";
+  return "older";
 }
 
 export function GradeHistoryDropdown({ open, onClose, anchorRect }: GradeHistoryDropdownProps) {
   // Re-read on each open so a freshly-saved grade appears without remounting.
   // Closed dropdowns don't pay the cost.
   const [entries, setEntries] = useState<CachedGrade[]>([]);
+  const [query, setQuery] = useState("");
   useEffect(() => {
-    if (open) setEntries(getCachedGrades());
+    if (open) {
+      setEntries(getCachedGrades());
+      // Reset query when re-opening so the previous filter doesn't ghost
+      // through (teacher's mental model: opening fresh = see everything).
+      setQuery("");
+    }
   }, [open]);
 
   // ESC closes — same UX as Memory / Help modals.
@@ -67,6 +112,32 @@ export function GradeHistoryDropdown({ open, onClose, anchorRect }: GradeHistory
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
+
+  // Filtered + grouped view. Filter against body + subject label so a
+  // teacher searching "sinh" finds bio essays even when the row title is
+  // just the đề name. Recomputed only when entries/query change.
+  const groups = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const filtered = q
+      ? entries.filter((e) => {
+          const { body } = parseTaskContext(e.task);
+          const subj = subjectLabel(e.subject).toLowerCase();
+          return body.toLowerCase().includes(q) || subj.includes(q);
+        })
+      : entries;
+    const out: Record<Bucket, CachedGrade[]> = {
+      today: [],
+      yesterday: [],
+      week: [],
+      older: [],
+    };
+    for (const entry of filtered) {
+      out[bucketOf(entry.ts)].push(entry);
+    }
+    return out;
+  }, [entries, query]);
+
+  const totalVisible = groups.today.length + groups.yesterday.length + groups.week.length + groups.older.length;
 
   const handleLoad = useCallback(
     (id: string, step: 3 | 4 | 5 = 3) => {
@@ -179,7 +250,39 @@ export function GradeHistoryDropdown({ open, onClose, anchorRect }: GradeHistory
           )}
         </div>
 
-        {/* Body — scrollable list */}
+        {/* Search box — only shown once there's at least one entry. Hidden
+            on a fresh empty cache to keep the "Chưa có bài" empty state
+            as the primary content. */}
+        {entries.length > 0 && (
+          <div
+            style={{
+              padding: `${T.space[2]}px ${T.space[4]}px`,
+              borderBottom: `1px solid ${T.borderLight}`,
+            }}
+          >
+            <input
+              type="search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Tìm theo tên đề hoặc môn…"
+              aria-label="Tìm trong lịch sử bài chấm"
+              autoFocus
+              style={{
+                width: "100%",
+                background: T.bg,
+                border: `1px solid ${T.borderLight}`,
+                borderRadius: 6,
+                padding: "6px 10px",
+                fontFamily: T.font,
+                fontSize: T.fontSize.sm,
+                color: T.text,
+                outline: "none",
+              }}
+            />
+          </div>
+        )}
+
+        {/* Body — scrollable list grouped by recency bucket */}
         <div style={{ overflowY: "auto", flex: 1 }}>
           {entries.length === 0 ? (
             <div
@@ -193,17 +296,53 @@ export function GradeHistoryDropdown({ open, onClose, anchorRect }: GradeHistory
             >
               Chưa có bài chấm nào trong lịch sử.
               <div style={{ marginTop: T.space[2], fontSize: T.fontSize.xs, color: T.textFaint }}>
-                Mỗi lần chấm thành công sẽ tự lưu vào đây (tối đa 15 bài gần nhất).
+                Mỗi lần chấm thành công sẽ tự lưu vào đây (tối đa 50 bài gần nhất).
               </div>
             </div>
+          ) : totalVisible === 0 ? (
+            <div
+              style={{
+                padding: `${T.space[8]}px ${T.space[5]}px`,
+                textAlign: "center",
+                color: T.textMute,
+                fontSize: T.fontSize.sm,
+              }}
+            >
+              Không có bài nào khớp với “{query.trim()}”.
+            </div>
           ) : (
-            entries.map((entry) => (
-              <HistoryRow
-                key={entry.id}
-                entry={entry}
-                onLoad={(step) => handleLoad(entry.id, step)}
-              />
-            ))
+            BUCKET_ORDER.map((bucket) => {
+              const rows = groups[bucket];
+              if (rows.length === 0) return null;
+              return (
+                <section key={bucket}>
+                  <div
+                    style={{
+                      padding: `${T.space[2]}px ${T.space[4]}px`,
+                      background: T.bg,
+                      color: T.textMute,
+                      fontSize: 11,
+                      fontWeight: 600,
+                      letterSpacing: 0.5,
+                      textTransform: "uppercase",
+                      borderBottom: `1px solid ${T.borderLight}`,
+                      position: "sticky",
+                      top: 0,
+                      zIndex: 1,
+                    }}
+                  >
+                    {BUCKET_LABEL[bucket]} ({rows.length})
+                  </div>
+                  {rows.map((entry) => (
+                    <HistoryRow
+                      key={entry.id}
+                      entry={entry}
+                      onLoad={(step) => handleLoad(entry.id, step)}
+                    />
+                  ))}
+                </section>
+              );
+            })
           )}
         </div>
 
@@ -227,16 +366,17 @@ export function GradeHistoryDropdown({ open, onClose, anchorRect }: GradeHistory
 }
 
 // Row layout:
-//   Title (clickable, body sans) ─────────────────► (opens step 3)
+//   Title (clickable, body sans) ─────────────────► (opens step 5 — phiếu chấm)
 //   Subject pill · 1 giờ trước
-//   [Chấm lại]  [Phiếu chấm]                  ◄── secondary affordances
+//   [Xem xét]  [Chấm lại]                     ◄── secondary affordances
 //
-// The whole row is the primary "open" action — defaults to step 3 (Xem
-// xét) because that's where a re-pass typically starts. Two small
-// secondary buttons let the teacher jump straight to step 4 or step 5
-// without forcing them through review. Earlier design had three
-// equal-weight pill buttons + a "Mở ở:" eyebrow which created decision
-// fatigue and let the actions out-shout the title.
+// The whole row is the primary "open" action — defaults to step 5 (Xong /
+// phiếu chấm) because "Bài đã chấm" implies the teacher wants to SEE the
+// completed grade, not re-evaluate it. Two small secondary buttons let
+// the teacher jump back to step 3 (Xem xét, re-review) or step 4 (Chấm
+// lại, regrade) when that IS the intent. Earlier design defaulted to
+// step 3 and surprised teachers who clicked a row expecting the final
+// grade sheet (real user report 2026-05-19).
 
 function HistoryRow({
   entry,
@@ -246,20 +386,21 @@ function HistoryRow({
   onLoad: (step: 3 | 4 | 5) => void;
 }) {
   const [hovered, setHovered] = useState(false);
+  const { body, classLabel } = parseTaskContext(entry.task);
   return (
     <div
       role="button"
       tabIndex={0}
-      onClick={() => onLoad(3)}
+      onClick={() => onLoad(5)}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          onLoad(3);
+          onLoad(5);
         }
       }}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
-      title="Mở bài chấm này (bắt đầu ở bước Xem xét)"
+      title="Xem bài chấm này (mở thẳng phiếu chấm)"
       style={{
         background: hovered ? T.bgHover : "transparent",
         borderBottom: `1px solid ${T.borderLight}`,
@@ -289,7 +430,7 @@ function HistoryRow({
           whiteSpace: "nowrap",
         }}
       >
-        {shortTaskLabel(entry.task)}
+        {body}
       </div>
       <div
         style={{
@@ -313,6 +454,12 @@ function HistoryRow({
         >
           {subjectLabel(entry.subject)}
         </span>
+        {classLabel && (
+          <>
+            <span>·</span>
+            <span>{classLabel}</span>
+          </>
+        )}
         <span>·</span>
         <span>{relativeTime(entry.ts)}</span>
       </div>
@@ -325,23 +472,23 @@ function HistoryRow({
         }}
       >
         {/* Secondary jumps. ``stopPropagation`` prevents the parent row
-            click handler from firing — without it, clicking "Phiếu
-            chấm" would open step 3 AND step 5 in succession. */}
+            click handler from firing — without it, clicking these would
+            also open step 5 (the row default) in succession. */}
+        <SecondaryJump
+          label="Xem xét"
+          hint="Mở ở bước Xem xét (đọc lại nhận xét của AI)"
+          onClick={(e) => {
+            e.stopPropagation();
+            onLoad(3);
+          }}
+        />
+        <span style={{ color: T.textFaint, fontSize: 11 }}>·</span>
         <SecondaryJump
           label="Chấm lại"
           hint="Mở thẳng ở bước Chấm lại (bỏ qua Xem xét)"
           onClick={(e) => {
             e.stopPropagation();
             onLoad(4);
-          }}
-        />
-        <span style={{ color: T.textFaint, fontSize: 11 }}>·</span>
-        <SecondaryJump
-          label="Phiếu chấm"
-          hint="Mở thẳng ở bước Kết quả / in phiếu chấm"
-          onClick={(e) => {
-            e.stopPropagation();
-            onLoad(5);
           }}
         />
       </div>
