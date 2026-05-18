@@ -15,7 +15,6 @@ export function LoadingSpinner({ title, description }: LoadingSpinnerProps) {
         justifyContent: "center",
         minHeight: "50vh",
         gap: 20,
-        animation: "fadeUp 0.5s ease-out",
         textAlign: "center",
       }}
     >

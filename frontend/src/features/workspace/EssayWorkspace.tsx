@@ -67,7 +67,6 @@ function WaitingForSubjectHero() {
         borderRadius: 16,
         boxShadow: T.shadowSoft,
         textAlign: "center",
-        animation: "fadeUp 0.4s ease-out",
       }}
     >
       <div
@@ -397,7 +396,6 @@ export function EssayWorkspace({
             borderRadius: 8,
             fontSize: 16,
             color: T.red,
-            animation: "fadeUp 0.3s ease-out",
           }}
         >
           <span

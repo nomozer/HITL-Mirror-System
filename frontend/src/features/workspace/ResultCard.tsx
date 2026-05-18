@@ -225,7 +225,18 @@ export function ResultCard({
 
   const handleFinalize = () => {
     if (onFinalize && !isFinalizing) {
-      onFinalize({ scores, overall });
+      // Send the teacher's per-câu sum as the final overall — that's what
+      // the hero is showing the teacher right now. The previous version
+      // sent ``grade.overall`` (AI's rubric-derived overall), which meant
+      // step 4 edits were silently discarded: hero showed 8.0 (teacher's
+      // sum after edit), but POST /api/finalize-grade persisted 8.5 (AI's
+      // overall), so the locked-state hero snapped BACK to 8.5 after
+      // save. Rubric scores stay at AI's values since the current flow
+      // has no rubric editor — fine as long as overall reflects the
+      // teacher's actual decision.
+      const teacherOverall =
+        typeof displayOverall === "number" ? displayOverall : overall;
+      onFinalize({ scores, overall: teacherOverall });
     }
   };
   const handlePrint = () => {
@@ -340,7 +351,6 @@ export function ResultCard({
         style={{
           maxWidth: 1080,
           margin: "0 auto",
-          animation: "fadeUp 0.4s ease-out",
         }}
       >
         {/* Status pill — only shown for the *informative* states: "đã lưu"

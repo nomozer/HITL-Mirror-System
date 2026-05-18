@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ApiError,
   deleteLesson,
@@ -67,9 +67,11 @@ function sourceFromLesson(lesson: Pick<Lesson, "feedback_score" | "lesson_text">
 // Unknown codes fall through to ``subjectLabel`` which capitalizes the raw key,
 // so a brand-new subject (e.g. "chem") still renders without a code change.
 const SUBJECT_LABEL: Record<string, string> = {
-  cs: "Tin học",
+  cs:   "Tin học",
   math: "Toán",
   phys: "Vật lý",
+  chem: "Hoá học",
+  bio:  "Sinh học",
   stem: "STEM",
   unknown: "Khác",
 };
@@ -92,6 +94,52 @@ function formatLessonId(id: number): string {
   return `L-${id.toString().padStart(4, "0")}`;
 }
 
+// Stale-while-revalidate snapshot. Persisted to localStorage so the panel
+// renders the last-known data INSTANTLY across page reloads, then revalidates
+// in the background. Without persistence the first paint after a refresh
+// flashed EmptyState → skeleton → real data, which the teacher flagged as
+// "đợi mấy mili giây mới ra nội dung". Stored only for the unfiltered view
+// (subject="" && search="") — filtered fetches don't pollute the cache
+// because hydrating a filtered subset on the next mount would hide other
+// lessons until search clears. The cache is best-effort: any storage
+// failure (Safari private mode, full quota, disabled by user) silently
+// degrades back to in-memory + skeleton-on-first-load.
+type MemorySnapshot = {
+  lessons: Lesson[];
+  stats: MemoryStats | null;
+};
+
+const SNAPSHOT_STORAGE_KEY = "hitl.memory.snapshot.v1";
+
+function readSnapshotFromStorage(): MemorySnapshot | null {
+  try {
+    const raw = window.localStorage.getItem(SNAPSHOT_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      !Array.isArray(parsed.lessons)
+    ) {
+      return null;
+    }
+    return { lessons: parsed.lessons, stats: parsed.stats ?? null };
+  } catch {
+    return null;
+  }
+}
+
+function writeSnapshotToStorage(snap: MemorySnapshot): void {
+  try {
+    window.localStorage.setItem(SNAPSHOT_STORAGE_KEY, JSON.stringify(snap));
+  } catch {
+    // Quota or privacy mode — fall through to in-memory only.
+  }
+}
+
+let memorySnapshot: MemorySnapshot | null =
+  typeof window !== "undefined" ? readSnapshotFromStorage() : null;
+
 export function MemoryPanel() {
   const handleClose = useCallback(() => {
     if (window.opener && !window.opener.closed) {
@@ -102,12 +150,24 @@ export function MemoryPanel() {
     window.location.reload();
   }, []);
 
-  const [lessons, setLessons] = useState<Lesson[]>([]);
-  const [stats, setStats] = useState<MemoryStats | null>(null);
+  // Hydrate from the module snapshot so re-mount renders instantly.
+  // Lazy-init form of useState (function arg) — only the first render
+  // reads memorySnapshot, subsequent renders use the state value.
+  const [lessons, setLessons] = useState<Lesson[]>(
+    () => memorySnapshot?.lessons ?? [],
+  );
+  const [stats, setStats] = useState<MemoryStats | null>(
+    () => memorySnapshot?.stats ?? null,
+  );
   const [subject, setSubject] = useState<SubjectFilter>("");
   const [source, setSource] = useState<SourceFilter>("");
   const [search, setSearch] = useState("");
-  const [loading, setLoading] = useState(false);
+  // Initial loading state mirrors "do we have anything to show right
+  // now?". Without cache → loading=true so the brief gap between mount
+  // and the useEffect-triggered fetch renders skeleton, not EmptyState.
+  // With cache → loading=false so the cached lessons render instantly
+  // and revalidation happens silently in the background (true SWR).
+  const [loading, setLoading] = useState(() => memorySnapshot === null);
   const [error, setError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<number | null>(null);
 
@@ -125,6 +185,17 @@ export function MemoryPanel() {
         ]);
         setLessons(list.items);
         setStats(st);
+        // Snapshot only the unfiltered view — filtered fetches would
+        // hydrate the next remount with a partial list, leaving older
+        // lessons invisible until search clears. Cheap check on both
+        // filter fields to keep the cache trustworthy. Persist to
+        // localStorage too so the next page reload hydrates instantly
+        // instead of flashing skeleton → empty → data.
+        if (!subject && !search) {
+          const snap = { lessons: list.items, stats: st };
+          memorySnapshot = snap;
+          writeSnapshotToStorage(snap);
+        }
       } catch (err) {
         if ((err as Error).name === "AbortError") return;
         const msg = err instanceof ApiError ? err.detail : (err as Error).message;
@@ -136,11 +207,19 @@ export function MemoryPanel() {
     [subject, search],
   );
 
+  // 250ms debounce was meant to coalesce search-input keystrokes, but it
+  // also delayed the initial fetch — opening "Bộ nhớ HITL" sat for ~300ms
+  // with a skeleton before data even started loading, which read as lag.
+  // First mount fires immediately; subsequent renders (when subject/
+  // search changes) still debounce.
+  const firstFetchRef = useRef(true);
   useEffect(() => {
     const ctrl = new AbortController();
+    const delay = firstFetchRef.current ? 0 : 250;
+    firstFetchRef.current = false;
     const handle = setTimeout(() => {
       fetchAll(ctrl.signal);
-    }, 250);
+    }, delay);
     return () => {
       clearTimeout(handle);
       ctrl.abort();
@@ -151,9 +230,26 @@ export function MemoryPanel() {
     setDeletingId(id);
     try {
       await deleteLesson(id);
-      setLessons((prev) => prev.filter((l) => l.id !== id));
+      setLessons((prev) => {
+        const next = prev.filter((l) => l.id !== id);
+        // Keep both caches (in-memory + localStorage) in sync —
+        // otherwise the next remount or page reload hydrates with a
+        // list still containing the deleted lesson until the
+        // background refresh resolves.
+        if (memorySnapshot) {
+          memorySnapshot = { ...memorySnapshot, lessons: next };
+          writeSnapshotToStorage(memorySnapshot);
+        }
+        return next;
+      });
       getMemoryStats()
-        .then(setStats)
+        .then((st) => {
+          setStats(st);
+          if (memorySnapshot) {
+            memorySnapshot = { ...memorySnapshot, stats: st };
+            writeSnapshotToStorage(memorySnapshot);
+          }
+        })
         .catch(() => undefined);
     } catch (err) {
       const msg = err instanceof ApiError ? err.detail : (err as Error).message;
@@ -301,6 +397,12 @@ export function MemoryPanel() {
           pills={subjectPills}
           active={subject}
           onChange={(v) => setSubject(v as SubjectFilter)}
+          // Top 5 (Mọi môn + 4 môn dùng nhiều nhất) + "+N môn khác"
+          // toggle. Chọn 5 vì viewport thường vẫn fit trên 1 dòng cùng
+          // ô search + source pills; trên 5 sẽ wrap xuống dòng 2 và
+          // cluttered. Source pills không cần overflow vì code hardcode
+          // 6 items, không scale theo data.
+          maxVisible={5}
         />
       </div>
 
@@ -487,14 +589,40 @@ function PillGroup<V extends string>({
   pills,
   active,
   onChange,
+  maxVisible,
 }: {
   pills: Array<{ value: V; label: string }>;
   active: V;
   onChange: (v: V) => void;
+  /** When set and ``pills.length > maxVisible``, collapse the overflow
+   *  into a "+N môn khác" toggle pill. The currently-active pill is
+   *  force-promoted into the visible head if it sits in the overflow
+   *  tail, so the teacher's selection never disappears mid-session.
+   *  Omit (default) for fixed pill sets like source filters where the
+   *  count is bounded by code, not by data. */
+  maxVisible?: number;
 }) {
+  const [expanded, setExpanded] = useState(false);
+  const cap = maxVisible ?? Infinity;
+  const needsOverflow = pills.length > cap;
+
+  let visible: typeof pills = pills;
+  let hiddenCount = 0;
+  if (needsOverflow && !expanded) {
+    const activeIdx = pills.findIndex((p) => p.value === active);
+    if (activeIdx >= cap) {
+      // Active pill lives in the tail — swap it into the head's last
+      // slot so the selection stays on screen after collapse.
+      visible = [...pills.slice(0, cap - 1), pills[activeIdx]];
+    } else {
+      visible = pills.slice(0, cap);
+    }
+    hiddenCount = pills.length - cap;
+  }
+
   return (
     <div style={{ display: "flex", gap: T.space[1], flexWrap: "wrap" }}>
-      {pills.map((pill) => {
+      {visible.map((pill) => {
         const isActive = pill.value === active;
         return (
           <button
@@ -528,6 +656,39 @@ function PillGroup<V extends string>({
           </button>
         );
       })}
+      {needsOverflow && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          title={
+            expanded
+              ? "Thu gọn lại"
+              : `Xem thêm ${hiddenCount} môn ${hiddenCount === 1 ? "khác" : "nữa"}`
+          }
+          style={{
+            background: "transparent",
+            border: `1px dashed ${T.border}`,
+            color: T.textFaint,
+            padding: `${T.space[1]}px ${T.space[3]}px`,
+            fontSize: T.fontSize.sm,
+            fontFamily: T.font,
+            fontStyle: "italic",
+            borderRadius: 999,
+            cursor: "pointer",
+            transition: "color 0.15s, border-color 0.15s",
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.color = T.text;
+            e.currentTarget.style.borderColor = T.text;
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.color = T.textFaint;
+            e.currentTarget.style.borderColor = T.border;
+          }}
+        >
+          {expanded ? "Thu gọn" : `+${hiddenCount} môn khác`}
+        </button>
+      )}
     </div>
   );
 }

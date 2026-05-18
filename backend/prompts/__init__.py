@@ -32,6 +32,8 @@ from .base import (
 from .math import GRADER_SYSTEM_MATH
 from .cs import GRADER_SYSTEM_CS
 from .phys import GRADER_SYSTEM_PHYS
+from .chem import GRADER_SYSTEM_CHEM
+from .bio import GRADER_SYSTEM_BIO
 
 
 # Registry of subject → full system prompt. Keys are the canonical subject
@@ -41,11 +43,14 @@ GRADER_SYSTEM: dict[str, str] = {
     "math": GRADER_SYSTEM_MATH,
     "cs":   GRADER_SYSTEM_CS,
     "phys": GRADER_SYSTEM_PHYS,
+    "chem": GRADER_SYSTEM_CHEM,
+    "bio":  GRADER_SYSTEM_BIO,
 }
 
 # Fallback when no explicit hint + no keyword match in task text.
 # "cs" chosen because the frontend Sidebar currently defaults to "Môn Tin".
-# Supported subjects: "math", "cs", "phys".
+# Supported subjects: "math", "cs", "phys", "chem", "bio" (full STEM /
+# tự nhiên cluster).
 DEFAULT_SUBJECT: str = "cs"
 
 
@@ -78,6 +83,34 @@ _PHYS_KEYWORDS = (
     "nhiệt", "nhiet", "dao động", "dao dong", "sóng", "song",
     "newton", "định luật", "dinh luat", "bảo toàn", "bao toan",
     "khối lượng", "khoi luong", "trọng lực", "trong luc",
+)
+
+_CHEM_KEYWORDS = (
+    "hoá học", "hóa học", "hoa hoc", "môn hoá", "môn hóa", "mon hoa",
+    "phương trình hoá", "phuong trinh hoa", "cân bằng", "can bang",
+    "oxi hoá", "oxi hóa", "oxi hoa", "khử", "khu",
+    "axit", "bazơ", "bazo", "muối", "muoi",
+    "kim loại", "kim loai", "phi kim", "halogen",
+    "mol", "đktc", "dktc", "nồng độ", "nong do", "dung dịch", "dung dich",
+    "phản ứng", "phan ung", "kết tủa", "ket tua", "điện phân", "dien phan",
+    "hidrocacbon", "hidrocarbon", "ancol", "andehit", "este", "amin",
+    "polime", "este hoá", "este hoa", "thuỷ phân", "thuy phan",
+    "iupac", "công thức phân tử", "cong thuc phan tu",
+)
+
+_BIO_KEYWORDS = (
+    "sinh học", "sinh hoc", "môn sinh", "mon sinh",
+    "tế bào", "te bao", "mô", "cơ quan", "co quan", "hệ cơ quan", "he co quan",
+    "di truyền", "di truyen", "kiểu gen", "kieu gen", "kiểu hình", "kieu hinh",
+    "menđen", "mendel", "punnett", "alen", "tính trạng", "tinh trang",
+    "nhiễm sắc thể", "nhiem sac the", "nst", "dna", "adn", "rna", "arn",
+    "đột biến", "dot bien", "phiên mã", "phien ma", "dịch mã", "dich ma",
+    "quang hợp", "quang hop", "hô hấp", "ho hap", "enzim", "enzyme",
+    "tiến hoá", "tien hoa", "chọn lọc", "chon loc", "darwin", "lamarck",
+    "sinh thái", "sinh thai", "quần thể", "quan the", "quần xã", "quan xa",
+    "chuỗi thức ăn", "chuoi thuc an", "lưới thức ăn", "luoi thuc an",
+    "phân loại", "phan loai", "loài", "loai", "ngành", "nganh",
+    "động vật", "dong vat", "thực vật", "thuc vat", "vi khuẩn", "vi khuan",
 )
 
 # UI metadata prefix produced by ``buildTaskContext`` on the frontend:
@@ -116,20 +149,27 @@ def detect_subject(task: str, hint: str | None = None) -> str:
 
     t = (task or "").lower()
     body = _UI_PREFIX_RE.sub("", t).strip() or t
-    cs_score   = sum(1 for k in _CS_KEYWORDS   if k in body)
-    math_score = sum(1 for k in _MATH_KEYWORDS if k in body)
-    phys_score = sum(1 for k in _PHYS_KEYWORDS if k in body)
+    scores = {
+        "cs":   sum(1 for k in _CS_KEYWORDS   if k in body),
+        "math": sum(1 for k in _MATH_KEYWORDS if k in body),
+        "phys": sum(1 for k in _PHYS_KEYWORDS if k in body),
+        "chem": sum(1 for k in _CHEM_KEYWORDS if k in body),
+        "bio":  sum(1 for k in _BIO_KEYWORDS  if k in body),
+    }
 
-    best = max(cs_score, math_score, phys_score)
+    best = max(scores.values())
     if best == 0:
         return DEFAULT_SUBJECT
-    # Tie between subjects → prefer DEFAULT_SUBJECT ordering
-    if phys_score == best and phys_score > max(cs_score, math_score):
-        return "phys"
-    if math_score == best and math_score > cs_score:
-        return "math"
-    if cs_score == best and cs_score > max(math_score, phys_score):
-        return "cs"
+    # Pick the subject with the highest score. Ties are broken by the
+    # iteration order below — chosen so the more "scientific identity"
+    # subjects (chem / bio / phys with specific vocabulary) win over the
+    # more generic math / cs when the body happens to mention both.
+    # Adjust the order if you ship a new subject and need a different tie
+    # rule rather than touching the score logic per-subject.
+    priority = ("chem", "bio", "phys", "math", "cs")
+    for code in priority:
+        if scores[code] == best:
+            return code
     return DEFAULT_SUBJECT
 
 

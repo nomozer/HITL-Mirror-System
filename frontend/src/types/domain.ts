@@ -4,7 +4,7 @@
  */
 
 export type Subject = "literature" | "stem" | "language" | "history";
-export type BackendSubject = "math" | "cs" | "phys";
+export type BackendSubject = "math" | "cs" | "phys" | "chem" | "bio";
 
 export type Lang = "en" | "vi";
 

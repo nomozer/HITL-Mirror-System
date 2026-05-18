@@ -79,7 +79,6 @@ export function StepUpload({
       style={{
         maxWidth: T.width.form,
         margin: "0 auto",
-        animation: "fadeUp 0.4s ease-out",
       }}
     >
       {/* ── Task PDF Upload ── */}

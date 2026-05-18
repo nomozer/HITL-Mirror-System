@@ -1974,7 +1974,6 @@ export function StepReview({
       style={{
         maxWidth: 1200,
         margin: "0 auto",
-        animation: "fadeUp 0.4s ease-out",
       }}
     >
       {/* Top toolbar — horizontal padding matches the QuestionBox card's

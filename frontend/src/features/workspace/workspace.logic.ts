@@ -48,9 +48,25 @@ export function buildTaskContext(
   return parts.join(" · ");
 }
 
-/** Map UI subject labels to backend subject codes. */
+/** Map UI subject labels to backend subject codes. Order of checks is
+ *  intentional — more specific tokens first so "Hoá" doesn't accidentally
+ *  trigger any of the broader subject branches via substring overlap. */
 export function subjectCodeFromSelection(selectedSubject: string): BackendSubject | null {
   const folded = String(selectedSubject || "").toLowerCase();
+  if (
+    folded.includes("hoá") ||
+    folded.includes("hóa") ||
+    folded.includes("hoa") ||
+    folded.includes("chem")
+  ) {
+    return "chem";
+  }
+  if (
+    folded.includes("sinh") ||
+    folded.includes("bio")
+  ) {
+    return "bio";
+  }
   if (
     folded.includes("tin") ||
     folded.includes("lập trình") ||

@@ -194,7 +194,7 @@ export function Sidebar({
             <option value="" disabled style={{ fontFamily: T.font }}>
               -- Chọn môn --
             </option>
-            {["Môn Tin", "Môn Toán", "Môn Vật lý"].map((sub) => (
+            {["Môn Tin", "Môn Toán", "Môn Vật lý", "Môn Hoá học", "Môn Sinh học"].map((sub) => (
               <option key={sub} value={sub} style={{ fontFamily: T.font }}>
                 {sub}
               </option>

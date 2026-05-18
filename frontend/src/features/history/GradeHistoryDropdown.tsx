@@ -14,9 +14,11 @@ interface GradeHistoryDropdownProps {
 }
 
 const SUBJECT_LABEL: Record<string, string> = {
-  cs: "Tin học",
+  cs:   "Tin học",
   math: "Toán",
   phys: "Vật lý",
+  chem: "Hoá học",
+  bio:  "Sinh học",
   stem: "STEM",
 };
 
