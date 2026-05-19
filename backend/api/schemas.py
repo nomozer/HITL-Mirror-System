@@ -216,3 +216,56 @@ class RegradeResponse(BaseModel):
     lessons_used: list[dict[str, Any]]
     run_id: int | None
     lesson_id: int | None = None
+
+
+# ---------------------------------------------------------------------------
+# /api/detect-subject — auto-classify the exam PDF before grading
+# ---------------------------------------------------------------------------
+
+
+class DetectSubjectRequest(BaseModel):
+    """Inputs for keyword-based subject detection on an uploaded exam.
+
+    The frontend used to require the teacher to pick a subject in a left
+    Sidebar before any grading could start (the picked code became the
+    backend ``subject`` hint, which is authoritative). Auto-detecting from
+    the exam PDF lets us drop that gate — the teacher uploads the PDF,
+    we read its first pages, score keywords, and surface the result as a
+    confirmation chip in the upload step.
+
+    Filename alone is intentionally weak: many teachers use generic names
+    like ``de_so_1.pdf``. The full PDF body usually carries dozens of
+    subject-specific terms, so the verdict is much more reliable.
+    """
+
+    task_pdf_b64: str = Field(
+        ...,
+        min_length=1,
+        description="Base64-encoded exam-prompt PDF (data URL or raw payload).",
+    )
+
+
+class DetectSubjectResponse(BaseModel):
+    """Detection verdict + raw scores.
+
+    ``confidence``: ``"high"`` when the top-1 score clearly dominates
+    (margin + minimum count threshold met), ``"low"`` when there is some
+    signal but it is ambiguous, ``"none"`` when no keywords matched. The
+    frontend uses confidence to decide whether to auto-apply the pick or
+    require explicit teacher confirmation before grading.
+    """
+
+    detected: str = Field(
+        ...,
+        description='Top-scoring subject code (matches GRADER_SYSTEM keys). '
+        'Always populated — falls back to DEFAULT_SUBJECT when confidence="none".',
+    )
+    confidence: str = Field(
+        ...,
+        description='"high" | "low" | "none"',
+    )
+    scores: dict[str, int] = Field(
+        default_factory=dict,
+        description="Keyword hit count per subject code. Surfaces the raw "
+        "signal so the UI can show a tooltip / debug overlay if needed.",
+    )

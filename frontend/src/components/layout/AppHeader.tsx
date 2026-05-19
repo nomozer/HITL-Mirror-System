@@ -1,10 +1,8 @@
 import { useRef } from "react";
 import { T } from "../../theme/tokens";
-import { Icon } from "../ui/Icon";
 
 interface AppHeaderProps {
-  /** Mobile-only — opens the Sidebar drawer when defined. */
-  onOpenDrawer?: () => void;
+  brand: string;
   onOpenMemory: () => void;
   onOpenHelp: () => void;
   memoryActive: boolean;
@@ -18,14 +16,19 @@ interface AppHeaderProps {
  * Top app bar — global navigation. Visible on both desktop and mobile.
  *
  * Layout:
- *   [hamburger? | brand]    Bộ nhớ HITL | Hướng dẫn
+ *   [MIRROR]                                      Bài đã chấm | Bộ nhớ HITL | Hướng dẫn
  *
- * Nav items are rendered as plain text links (no border, no icon) with
- * a thin vertical separator between them — the same restrained style as
- * a top-of-page document menu.
+ * Brand-only header: tagline was removed because it duplicated the
+ * brand for a single-user app — user already knows what MIRROR is, the
+ * subtitle was just visual noise competing with the brand for reading
+ * order. Subject picker and class label are also gone (replaced by the
+ * per-tab SubjectChip inside StepUpload, fed by /api/detect-subject).
+ *
+ * Nav items remain plain text links with a thin vertical separator — same
+ * restrained style as a top-of-page document menu.
  */
 export function AppHeader({
-  onOpenDrawer,
+  brand,
   onOpenMemory,
   onOpenHelp,
   memoryActive,
@@ -48,40 +51,22 @@ export function AppHeader({
         alignItems: "center",
         justifyContent: "space-between",
         gap: 12,
+        flexWrap: "wrap",
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
-        {onOpenDrawer && (
-          <button
-            type="button"
-            onClick={onOpenDrawer}
-            aria-label="Mở thanh điều khiển"
-            title="Mở thanh điều khiển"
-            style={{
-              background: "transparent",
-              border: "none",
-              color: T.textSoft,
-              padding: 6,
-              borderRadius: 6,
-              display: "inline-flex",
-              alignItems: "center",
-              justifyContent: "center",
-              transition: "color 0.15s, background 0.15s",
-              flexShrink: 0,
-            }}
-            onMouseEnter={(e) => {
-              e.currentTarget.style.color = T.accent;
-              e.currentTarget.style.background = T.accentSoft;
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.color = T.textSoft;
-              e.currentTarget.style.background = "transparent";
-            }}
-          >
-            <Icon.Menu size={20} />
-          </button>
-        )}
-      </div>
+      <span
+        style={{
+          fontFamily: T.display,
+          fontSize: T.fontSize.xl,
+          fontWeight: 700,
+          color: T.accentDark,
+          letterSpacing: 0,
+          lineHeight: 1,
+          flex: "0 0 auto",
+        }}
+      >
+        {brand}
+      </span>
 
       <nav
         style={{

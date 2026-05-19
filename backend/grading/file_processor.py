@@ -164,3 +164,60 @@ def decode_task_pdf(task_pdf_b64: str | None) -> dict[str, Any] | None:
     instead of page-by-page OCR.
     """
     return _decode_image(task_pdf_b64)
+
+
+# Default page cap for subject-detection text extraction. Two pages is
+# enough to clear the cover/instructions and reach the first question
+# block, which is dense with subject-specific vocabulary. Going wider
+# costs CPU without changing the verdict.
+_DETECT_MAX_PAGES = 2
+
+
+def _extract_pdf_text_sync(raw: bytes, max_pages: int) -> str:
+    """Pull plain text from the first ``max_pages`` of a PDF.
+
+    Used by ``/api/detect-subject`` to feed real exam content (instead of
+    the bare filename metadata) into ``prompts.score_subjects``. Returns
+    "" on any PyMuPDF failure — the caller treats that as "no signal" and
+    falls back to DEFAULT_SUBJECT.
+    """
+    chunks: list[str] = []
+    try:
+        doc = fitz.open(stream=raw, filetype="pdf")
+    except Exception as exc:  # pragma: no cover — corrupt PDF
+        logger.warning("[HITL] PDF open for text extract failed: %s", exc)
+        return ""
+    try:
+        for i, page in enumerate(doc):
+            if i >= max_pages:
+                break
+            try:
+                chunks.append(page.get_text("text") or "")
+            except Exception as exc:  # pragma: no cover — page-level failure
+                logger.warning("[HITL] page.get_text failed on page %d: %s", i, exc)
+    finally:
+        doc.close()
+    return "\n".join(chunks)
+
+
+async def extract_pdf_text(
+    task_pdf_b64: str | None,
+    *,
+    max_pages: int = _DETECT_MAX_PAGES,
+) -> str:
+    """Extract text from the first pages of an exam PDF (async wrapper).
+
+    Returns "" when ``task_pdf_b64`` is empty or the PDF cannot be parsed.
+    CPU-bound work runs in a worker thread so the FastAPI event loop stays
+    responsive.
+    """
+    if not task_pdf_b64:
+        return ""
+    decoded = _decode_image(task_pdf_b64)
+    if not decoded:
+        return ""
+    mime = decoded.get("mime_type", "").lower()
+    if "pdf" not in mime:
+        return ""
+    raw: bytes = decoded["data"]
+    return await asyncio.to_thread(_extract_pdf_text_sync, raw, max_pages)

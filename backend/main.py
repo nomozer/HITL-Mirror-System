@@ -45,6 +45,8 @@ from api.middleware import make_csrf_origin_guard, normalize_origin
 from api.schemas import (
     AnalyzeCommentRequest,
     AnalyzeCommentResponse,
+    DetectSubjectRequest,
+    DetectSubjectResponse,
     FeedbackRequest,
     FeedbackResponse,
     FinalizeGradeRequest,
@@ -59,11 +61,13 @@ from grading import (
     PromptOrchestrator,
     compute_per_question_deltas,
     compute_score_deltas,
+    extract_pdf_text,
     format_delta_lesson,
     looks_like_timeout,
     safe_delta,
 )
 from memory import MemoryManager, log_event as log_hitl_event
+from prompts import DEFAULT_SUBJECT, pick_top_subject, score_subjects
 
 # Kick off heartbeat watchdog before FastAPI bootstrap so it catches startup
 # failures too. No-op under DEV_MODE=1.
@@ -504,6 +508,61 @@ async def finalize_grade(req: FinalizeGradeRequest):
         delta_lesson_id=delta_lesson_id,
         deltas=deltas_out,
         message=message,
+    )
+
+
+@app.post("/api/detect-subject", response_model=DetectSubjectResponse)
+async def detect_subject_endpoint(req: DetectSubjectRequest):
+    """Auto-classify the subject of an uploaded exam PDF.
+
+    Pipeline: decode PDF → extract text from first ``_DETECT_MAX_PAGES``
+    pages (PyMuPDF, no Gemini call) → keyword-score against each subject's
+    vocabulary list → return the top pick + confidence + raw scores.
+
+    Confidence rule (matches what the frontend chip needs to decide
+    "auto-apply" vs "ask the teacher to confirm"):
+      * ``high`` — top1 ≥ 5 hits AND top1 ≥ top2 + 3. Big margin + enough
+                   absolute signal to trust the verdict silently.
+      * ``low``  — some signal (top1 ≥ 1) but margin too narrow or count
+                   too small. UI should highlight the chip and require
+                   an explicit confirmation click.
+      * ``none`` — no keyword matched at all. ``detected`` falls back to
+                   DEFAULT_SUBJECT but the chip should ask the teacher to
+                   pick manually.
+    """
+    HIGH_MIN_TOP = 5
+    HIGH_MIN_MARGIN = 3
+
+    try:
+        text = await extract_pdf_text(req.task_pdf_b64)
+    except Exception as exc:  # decode/IO problems
+        logger.exception("detect-subject text extraction failed")
+        raise HTTPException(status_code=400, detail=f"Cannot read PDF: {exc}") from exc
+
+    scores = score_subjects(text)
+    detected, top_score = pick_top_subject(scores)
+
+    if top_score == 0:
+        confidence = "none"
+        detected = DEFAULT_SUBJECT
+    else:
+        second = sorted(scores.values(), reverse=True)[1] if len(scores) > 1 else 0
+        if top_score >= HIGH_MIN_TOP and (top_score - second) >= HIGH_MIN_MARGIN:
+            confidence = "high"
+        else:
+            confidence = "low"
+
+    log_hitl_event(
+        "detect-subject",
+        detected=detected,
+        confidence=confidence,
+        top_score=top_score,
+        text_len=len(text),
+    )
+    return DetectSubjectResponse(
+        detected=detected,
+        confidence=confidence,
+        scores=scores,
     )
 
 

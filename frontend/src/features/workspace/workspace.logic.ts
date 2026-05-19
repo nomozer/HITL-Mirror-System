@@ -1,5 +1,3 @@
-import type { BackendSubject } from "../../types";
-
 /**
  * Pure helpers for EssayWorkspace — step transition logic.
  */
@@ -37,57 +35,18 @@ export function taskFromPdfName(name: string | null | undefined): string {
   return name.replace(/\.pdf$/i, "").replace(/[_-]+/g, " ");
 }
 
-/** Stable task descriptor used for backend retrieval/logging. */
+/** Stable task descriptor used for backend retrieval/logging.
+ *  Format: ``"<Môn> · <tên đề>"`` (no class — that prefix was removed
+ *  with the header class pill). ``parseTaskContext`` in
+ *  ``features/history/GradeHistoryDropdown`` is the canonical decoder
+ *  for both this format and the legacy 3-part ``"Môn · Lớp · tên"``
+ *  still present in older cached entries. */
 export function buildTaskContext(
   name: string | null | undefined,
   selectedSubject: string,
-  selectedClass: string,
 ): string {
   const label = taskFromPdfName(name);
-  const parts = [selectedSubject, selectedClass, label].filter(Boolean);
+  const parts = [selectedSubject, label].filter(Boolean);
   return parts.join(" · ");
 }
 
-/** Map UI subject labels to backend subject codes. Order of checks is
- *  intentional — more specific tokens first so "Hoá" doesn't accidentally
- *  trigger any of the broader subject branches via substring overlap. */
-export function subjectCodeFromSelection(selectedSubject: string): BackendSubject | null {
-  const folded = String(selectedSubject || "").toLowerCase();
-  if (
-    folded.includes("hoá") ||
-    folded.includes("hóa") ||
-    folded.includes("hoa") ||
-    folded.includes("chem")
-  ) {
-    return "chem";
-  }
-  if (
-    folded.includes("sinh") ||
-    folded.includes("bio")
-  ) {
-    return "bio";
-  }
-  if (
-    folded.includes("tin") ||
-    folded.includes("lập trình") ||
-    folded.includes("lap trinh") ||
-    folded.includes("computer") ||
-    folded.includes("cs")
-  ) {
-    return "cs";
-  }
-  if (folded.includes("toán") || folded.includes("toan") || folded.includes("math")) {
-    return "math";
-  }
-  if (
-    folded.includes("lý") ||
-    folded.includes("ly") ||
-    folded.includes("vật lý") ||
-    folded.includes("vat ly") ||
-    folded.includes("physics") ||
-    folded.includes("phys")
-  ) {
-    return "phys";
-  }
-  return null;
-}

@@ -113,14 +113,59 @@ _BIO_KEYWORDS = (
     "động vật", "dong vat", "thực vật", "thuc vat", "vi khuẩn", "vi khuan",
 )
 
-# UI metadata prefix produced by ``buildTaskContext`` on the frontend:
-#   "Môn Tin · Lớp 10 · <real task>"
+# UI metadata prefix produced by ``buildTaskContext`` on the frontend.
+# Two shapes seen over time:
+#   current : "Môn Tin · <real task>"           (class removed in 2026-05)
+#   legacy  : "Môn Tin · Lớp 10 · <real task>"  (still in old DB rows)
 # Stripped before keyword scoring so a "Môn Tin" prefix doesn't add a free
-# CS point that biases the count when the actual task body is math.
+# CS point that biases the count when the actual task body is math. The
+# ``lớp …`` middle segment is optional so both shapes collapse to the
+# same body.
 _UI_PREFIX_RE = re.compile(
-    r"^\s*môn\s+\S+\s*·\s*lớp\s+\d+\s*·\s*",
+    r"^\s*môn\s+\S+(?:\s*·\s*lớp\s+\d+)?\s*·\s*",
     re.IGNORECASE,
 )
+
+
+# Tie-break order: more "scientific identity" subjects (chem / bio / phys
+# with specific vocabulary) win over generic math / cs when scores tie.
+_TIE_PRIORITY: tuple[str, ...] = ("chem", "bio", "phys", "math", "cs")
+
+
+def score_subjects(text: str) -> dict[str, int]:
+    """Keyword-count each subject against ``text``.
+
+    Returns a {subject_code -> hit_count} map covering every key in
+    ``GRADER_SYSTEM``. Caller decides what to do with the counts —
+    ``detect_subject`` picks the top one with tie-breaking; the
+    ``/api/detect-subject`` endpoint exposes them all so the frontend can
+    show "Sinh học (12 hits) vs Hoá học (8 hits)" if needed.
+    """
+    body = (text or "").lower()
+    body = _UI_PREFIX_RE.sub("", body).strip() or body
+    return {
+        "cs":   sum(1 for k in _CS_KEYWORDS   if k in body),
+        "math": sum(1 for k in _MATH_KEYWORDS if k in body),
+        "phys": sum(1 for k in _PHYS_KEYWORDS if k in body),
+        "chem": sum(1 for k in _CHEM_KEYWORDS if k in body),
+        "bio":  sum(1 for k in _BIO_KEYWORDS  if k in body),
+    }
+
+
+def pick_top_subject(scores: dict[str, int]) -> tuple[str, int]:
+    """Pick the highest-scoring subject from a ``score_subjects`` map.
+
+    Returns ``(subject_code, top_score)``. When all scores are zero this
+    returns ``(DEFAULT_SUBJECT, 0)`` so the caller can detect the "no
+    signal" case via the score.
+    """
+    best = max(scores.values()) if scores else 0
+    if best == 0:
+        return DEFAULT_SUBJECT, 0
+    for code in _TIE_PRIORITY:
+        if scores.get(code, 0) == best:
+            return code, best
+    return DEFAULT_SUBJECT, best
 
 
 def detect_subject(task: str, hint: str | None = None) -> str:
@@ -147,30 +192,9 @@ def detect_subject(task: str, hint: str | None = None) -> str:
     if hint and hint in GRADER_SYSTEM:
         return hint
 
-    t = (task or "").lower()
-    body = _UI_PREFIX_RE.sub("", t).strip() or t
-    scores = {
-        "cs":   sum(1 for k in _CS_KEYWORDS   if k in body),
-        "math": sum(1 for k in _MATH_KEYWORDS if k in body),
-        "phys": sum(1 for k in _PHYS_KEYWORDS if k in body),
-        "chem": sum(1 for k in _CHEM_KEYWORDS if k in body),
-        "bio":  sum(1 for k in _BIO_KEYWORDS  if k in body),
-    }
-
-    best = max(scores.values())
-    if best == 0:
-        return DEFAULT_SUBJECT
-    # Pick the subject with the highest score. Ties are broken by the
-    # iteration order below — chosen so the more "scientific identity"
-    # subjects (chem / bio / phys with specific vocabulary) win over the
-    # more generic math / cs when the body happens to mention both.
-    # Adjust the order if you ship a new subject and need a different tie
-    # rule rather than touching the score logic per-subject.
-    priority = ("chem", "bio", "phys", "math", "cs")
-    for code in priority:
-        if scores[code] == best:
-            return code
-    return DEFAULT_SUBJECT
+    scores = score_subjects(task)
+    code, _ = pick_top_subject(scores)
+    return code
 
 
 __all__ = [
@@ -180,4 +204,6 @@ __all__ = [
     "RUBRIC_LABELS",
     "DEFAULT_SUBJECT",
     "detect_subject",
+    "score_subjects",
+    "pick_top_subject",
 ]

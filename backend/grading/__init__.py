@@ -15,6 +15,7 @@ Internal modules:
 """
 
 from .agent import AgentOrchestrator, PipelineResult, looks_like_timeout
+from .file_processor import extract_pdf_text
 from .prompt_orchestrator import PromptOrchestrator
 from .scoring import (
     RUBRIC_KEYS,
@@ -28,6 +29,7 @@ __all__ = [
     "AgentOrchestrator",
     "PipelineResult",
     "PromptOrchestrator",
+    "extract_pdf_text",
     "looks_like_timeout",
     "RUBRIC_KEYS",
     "compute_per_question_deltas",

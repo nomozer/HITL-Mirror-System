@@ -7,6 +7,7 @@ import {
   type MemoryStats,
 } from "../../api";
 import { Icon } from "../../components/ui/Icon";
+import { subscribeMemoryChanged } from "../../lib/memoryBus";
 import { T } from "../../theme/tokens";
 import type { Lesson } from "../../types";
 
@@ -225,6 +226,40 @@ export function MemoryPanel() {
       ctrl.abort();
     };
   }, [fetchAll]);
+
+  // Cross-window cache invalidation. When the Workspace (in a different
+  // browser window) submits feedback / finalizes / regrades, the API
+  // helpers emit on `memoryBus` and this listener picks it up so the
+  // teacher sees the new lesson without F5.
+  //
+  // `fetchAll` is captured via ref so this effect only subscribes once
+  // per mount — without the ref, every subject/search change would
+  // tear down and re-create the subscription. The 200 ms debounce
+  // coalesces bursts like "feedback then finalize", which would
+  // otherwise fire two back-to-back refetches.
+  const fetchAllRef = useRef(fetchAll);
+  fetchAllRef.current = fetchAll;
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const unsubscribe = subscribeMemoryChanged(() => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        // Drop cached views so a later remount/page-reload doesn't
+        // re-show the now-stale list while it revalidates.
+        memorySnapshot = null;
+        try {
+          window.localStorage.removeItem(SNAPSHOT_STORAGE_KEY);
+        } catch {
+          // No-op: quota / privacy mode.
+        }
+        fetchAllRef.current();
+      }, 200);
+    });
+    return () => {
+      if (timer) clearTimeout(timer);
+      unsubscribe();
+    };
+  }, []);
 
   const handleDelete = useCallback(async (id: number) => {
     setDeletingId(id);

@@ -1,4 +1,5 @@
 import { apiPost, type RequestOptions } from "./client";
+import { emitMemoryChanged } from "../lib/memoryBus";
 import type { BackendSubject, FeedbackAction, GenerateResponse } from "../types";
 
 export interface GenerateRequest {
@@ -31,5 +32,11 @@ export function generate(
 }
 
 export function regrade(req: RegradeRequest, options?: RequestOptions): Promise<GenerateResponse> {
-  return apiPost<RegradeRequest, GenerateResponse>("/regrade", req, options);
+  // /regrade is "save feedback then regrade" — the save-feedback step
+  // always writes a lesson (revise → 4.0 or reject → 5.0). /generate
+  // (first grade) is NOT wired because it never writes a lesson.
+  return apiPost<RegradeRequest, GenerateResponse>("/regrade", req, options).then((res) => {
+    emitMemoryChanged();
+    return res;
+  });
 }

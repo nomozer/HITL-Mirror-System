@@ -2,23 +2,28 @@
  * App.tsx — MIRROR root composer.
  *
  * Two top-level pages share the same SPA bundle, gated by the URL hash:
- *   • ``""`` (default)  → grading workspace (sidebar + tabs)
- *   • ``"#memory"``     → HITL Memory page (standalone, no sidebar)
+ *   • ``""`` (default)  → grading workspace (header + tabs)
+ *   • ``"#memory"``     → HITL Memory page (standalone)
  *
  * The header's "Bộ nhớ HITL" button opens ``#memory`` in a NEW browser
  * tab via ``window.open``, so the workspace tab keeps its full state
  * (tabs, uploads, in-flight grades) untouched in the background — same
  * mental model as middle-clicking a link in Chrome.
+ *
+ * Subject is no longer picked here. The old left-Sidebar subject selector
+ * is replaced by the per-tab `SubjectChip` inside `StepUpload`, which auto-
+ * detects the subject from the uploaded exam PDF via /api/detect-subject
+ * and lets the teacher override. Subject is therefore per-tab state owned
+ * by each `EssayWorkspace`. Class label survives as a global header pill
+ * because it's purely display metadata (not used by any grading prompt).
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { vi as t } from "./i18n/vi";
 import { T } from "./theme/tokens";
 import { GlobalStyles } from "./theme/GlobalStyles";
 import { useTabs } from "./hooks/useTabs";
 import { useHeartbeat } from "./hooks/useHeartbeat";
-import { useIsMobile } from "./hooks/useIsMobile";
-import { Sidebar } from "./components/layout/Sidebar";
 import { AppHeader } from "./components/layout/AppHeader";
 import { TabBar } from "./components/layout/TabBar";
 import { EssayWorkspace } from "./features/workspace/EssayWorkspace";
@@ -43,7 +48,7 @@ export default function App() {
 }
 
 // ---------------------------------------------------------------------------
-// Memory page — standalone, no sidebar / no tab bar / no heartbeat fight.
+// Memory page — standalone, no tab bar / no heartbeat fight.
 // ---------------------------------------------------------------------------
 
 function MemoryPage() {
@@ -60,12 +65,10 @@ function MemoryPage() {
 }
 
 // ---------------------------------------------------------------------------
-// Workspace page — sidebar, tab bar, essay workspaces.
+// Workspace page — header, tab bar, essay workspaces.
 // ---------------------------------------------------------------------------
 
 function WorkspacePage() {
-  const isMobile = useIsMobile();
-  const [drawerOpen, setDrawerOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   // History dropdown — open state + the trigger button's bounding rect so
   // the popover anchors under it. AppHeader hands us the rect because the
@@ -73,8 +76,6 @@ function WorkspacePage() {
   const [historyAnchor, setHistoryAnchor] = useState<DOMRect | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
 
-  const closeDrawer = useCallback(() => setDrawerOpen(false), []);
-  const openDrawer = useCallback(() => setDrawerOpen(true), []);
   const openHelp = useCallback(() => setHelpOpen(true), []);
   const closeHelp = useCallback(() => setHelpOpen(false), []);
   const toggleHistory = useCallback((rect: DOMRect | null) => {
@@ -89,48 +90,9 @@ function WorkspacePage() {
   const openMemoryTab = useCallback(() => {
     const url = window.location.origin + window.location.pathname + MEMORY_HASH;
     window.open(url, "_blank", "noopener,noreferrer");
-    setDrawerOpen(false);
   }, []);
-
-  // Auto-close the drawer on viewport upgrade so the sticky sidebar
-  // doesn't double-render on top of itself when crossing the breakpoint.
-  useEffect(() => {
-    if (!isMobile) setDrawerOpen(false);
-  }, [isMobile]);
-
-  // ESC closes the drawer for keyboard users.
-  useEffect(() => {
-    if (!drawerOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closeDrawer();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [drawerOpen, closeDrawer]);
 
   const { tabs, activeId, addTab, closeTab, clearAll, setActive, updateMeta } = useTabs();
-
-  // Hydrate subject from localStorage so a returning teacher does not have
-  // to re-pick. First-time users start with "" (no selection) and the
-  // workspace renders a waiting state until they choose — guarantees every
-  // saved lesson is stamped with the correct subject (cs/math).
-  const [selectedSubject, setSelectedSubjectState] = useState<string>(() => {
-    try {
-      return localStorage.getItem("hitl.selectedSubject") || "";
-    } catch {
-      return "";
-    }
-  });
-  const setSelectedSubject = useCallback((value: string) => {
-    setSelectedSubjectState(value);
-    try {
-      localStorage.setItem("hitl.selectedSubject", value);
-    } catch {
-      // localStorage may be disabled in private mode — best-effort persist.
-    }
-  }, []);
-
-  const [selectedClass, setSelectedClass] = useState<string>("Lớp 10");
 
   useHeartbeat();
 
@@ -140,75 +102,41 @@ function WorkspacePage() {
     <div
       style={{
         minHeight: "100vh",
-        display: "grid",
-        gridTemplateColumns: isMobile ? "1fr" : "260px 1fr",
+        display: "flex",
+        flexDirection: "column",
       }}
     >
       <GlobalStyles />
 
-      {/* Desktop: in-grid sticky sidebar. Mobile: portal-style drawer
-          rendered outside the grid so it can overlay the workspace. */}
-      {!isMobile && (
-        <Sidebar
-          t={t}
-          selectedSubject={selectedSubject}
-          onSubjectChange={setSelectedSubject}
-          selectedClass={selectedClass}
-          onClassChange={setSelectedClass}
-        />
-      )}
+      <AppHeader
+        brand={String(t.title)}
+        onOpenMemory={openMemoryTab}
+        onOpenHelp={openHelp}
+        memoryActive={false}
+        onToggleHistory={toggleHistory}
+        historyActive={historyOpen}
+      />
 
-      <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
-        <AppHeader
-          onOpenDrawer={isMobile ? openDrawer : undefined}
-          onOpenMemory={openMemoryTab}
-          onOpenHelp={openHelp}
-          memoryActive={false}
-          onToggleHistory={toggleHistory}
-          historyActive={historyOpen}
-        />
+      <TabBar
+        tabs={tabs}
+        activeId={activeId}
+        onSelect={setActive}
+        onAdd={addTab}
+        onClose={closeTab}
+        onClear={clearAll}
+        completedCount={completedCount}
+        t={t}
+      />
 
-        <TabBar
-          tabs={tabs}
-          activeId={activeId}
-          onSelect={setActive}
-          onAdd={addTab}
-          onClose={closeTab}
-          onClear={clearAll}
-          completedCount={completedCount}
-          t={t}
-        />
-
-        <main style={{ paddingTop: 12 }}>
-          {tabs.map((tab) => (
-            <EssayWorkspace
-              key={tab.id}
-              active={tab.id === activeId}
-              selectedSubject={selectedSubject}
-              selectedClass={selectedClass}
-              onMeta={(meta) => updateMeta(tab.id, meta)}
-            />
-          ))}
-        </main>
-      </div>
-
-      {/* Mobile drawer + backdrop. Mounted outside the grid so the drawer
-          overlays the workspace without affecting layout flow. */}
-      {isMobile && drawerOpen && (
-        <Sidebar
-          t={t}
-          selectedSubject={selectedSubject}
-          onSubjectChange={(value) => {
-            setSelectedSubject(value);
-            // Close on subject pick — the teacher's done with the drawer.
-            closeDrawer();
-          }}
-          selectedClass={selectedClass}
-          onClassChange={setSelectedClass}
-          drawer
-          onClose={closeDrawer}
-        />
-      )}
+      <main style={{ paddingTop: 12 }}>
+        {tabs.map((tab) => (
+          <EssayWorkspace
+            key={tab.id}
+            active={tab.id === activeId}
+            onMeta={(meta) => updateMeta(tab.id, meta)}
+          />
+        ))}
+      </main>
 
       {helpOpen && <HelpModal onClose={closeHelp} />}
 

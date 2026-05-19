@@ -1,9 +1,11 @@
 import { useCallback, useRef, useState } from "react";
 import { T } from "../../theme/tokens";
 import { Icon } from "../../components/ui/Icon";
+import { SubjectChip } from "../../components/ui/SubjectChip";
 import { readFileAsDataUrl, readOptimizedUploadDataUrl } from "../../lib/file";
 import { validateTaskFile, validateEssayFile } from "./StepUpload.logic";
-import type { EssayFile, I18nStrings, TaskFile } from "../../types";
+import type { BackendSubject, EssayFile, I18nStrings, TaskFile } from "../../types";
+import type { DetectConfidence } from "../../api";
 
 interface StepUploadProps {
   taskPdf: TaskFile | null;
@@ -13,6 +15,18 @@ interface StepUploadProps {
   onSubmit: () => void;
   canSubmit: boolean;
   t: I18nStrings;
+  // Subject autodetect — parent fires /api/detect-subject on each new task
+  // PDF and feeds the verdict in here. StepUpload only renders the chip;
+  // it never calls the detection endpoint itself, so the same chip can be
+  // reused from any future surface (regrade step, history reload, etc.)
+  // without duplicating the fetch logic.
+  subject: BackendSubject | null;
+  detectedSubject: BackendSubject | null;
+  subjectConfidence: DetectConfidence | null;
+  subjectDetecting: boolean;
+  subjectDetectError: string | null;
+  manualSubject: boolean;
+  onSubjectChange: (code: BackendSubject) => void;
 }
 
 export function StepUpload({
@@ -23,6 +37,13 @@ export function StepUpload({
   onSubmit,
   canSubmit,
   t,
+  subject,
+  detectedSubject,
+  subjectConfidence,
+  subjectDetecting,
+  subjectDetectError,
+  manualSubject,
+  onSubjectChange,
 }: StepUploadProps) {
   const taskInputRef = useRef<HTMLInputElement | null>(null);
   const essayInputRef = useRef<HTMLInputElement | null>(null);
@@ -213,6 +234,45 @@ export function StepUpload({
                 PDF
               </div>
             </div>
+          )}
+        </div>
+
+        {/* Subject auto-detection chip — replaces the old left-Sidebar
+            subject picker. Stays in "idle" until the teacher uploads a
+            PDF, then shows the backend's verdict. High confidence
+            auto-applies silently; low / none verdicts require an explicit
+            click on the chip before the submit button enables.
+            Lives beneath the PDF box so it visually attaches to the file
+            it describes — moving it elsewhere broke the cause/effect
+            chain ("which PDF did this detect?"). */}
+        <div
+          style={{
+            marginTop: T.space[3],
+            display: "flex",
+            alignItems: "center",
+            gap: T.space[3],
+            flexWrap: "wrap",
+          }}
+        >
+          <SubjectChip
+            subject={subject}
+            detected={detectedSubject}
+            confidence={subjectConfidence}
+            loading={subjectDetecting}
+            idle={!taskPdf}
+            manualOverride={manualSubject}
+            onChange={onSubjectChange}
+          />
+          {subjectDetectError && (
+            <span
+              style={{
+                fontSize: T.fontSize.sm,
+                color: T.red,
+                lineHeight: 1.4,
+              }}
+            >
+              {subjectDetectError}
+            </span>
           )}
         </div>
       </div>

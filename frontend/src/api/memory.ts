@@ -1,4 +1,5 @@
 import { apiDelete, apiGet, type RequestOptions } from "./client";
+import { emitMemoryChanged } from "../lib/memoryBus";
 import type { Lesson } from "../types";
 
 export interface ListLessonsQuery {
@@ -40,5 +41,12 @@ export function deleteLesson(
   lessonId: number,
   options?: RequestOptions,
 ): Promise<DeleteLessonResponse> {
-  return apiDelete<DeleteLessonResponse>(`/memory/lessons/${lessonId}`, options);
+  // Notify other open Memory Panel windows so their tables drop the row
+  // too. The calling window won't receive its own emit (BroadcastChannel
+  // does not deliver to the sender), which is intentional — local state
+  // already optimistic-updates.
+  return apiDelete<DeleteLessonResponse>(`/memory/lessons/${lessonId}`, options).then((res) => {
+    emitMemoryChanged();
+    return res;
+  });
 }

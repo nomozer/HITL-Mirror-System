@@ -1,14 +1,14 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAgentPipeline } from "../../hooks/useAgentPipeline";
 import { useFeedback } from "../../hooks/useFeedback";
-import { useIsMobile } from "../../hooks/useIsMobile";
-import { ApiError, finalizeGrade } from "../../api";
+import { ApiError, detectSubject, finalizeGrade, type DetectConfidence } from "../../api";
 import { T } from "../../theme/tokens";
 import { i18n } from "../../i18n";
 import { Icon } from "../../components/ui/Icon";
 import { parseCauHeader, parseGrade } from "../../lib/grade";
 import { LoadingSpinner } from "../../components/ui/LoadingSpinner";
 import { StepIndicator } from "../../components/layout/StepIndicator";
+import { subjectLabelOf } from "../../lib/subject";
 import { ResultCard } from "./ResultCard";
 import { ErrorBoundary } from "../../components/ui/ErrorBoundary";
 import { StepUpload } from "../upload/StepUpload";
@@ -19,10 +19,10 @@ import {
   deriveDisplayStep,
   nextStepOnPhaseChange,
   stepAfterGrade,
-  subjectCodeFromSelection,
   taskFromPdfName,
 } from "./workspace.logic";
 import type {
+  BackendSubject,
   EssayFile,
   FinalizedResult,
   Grade,
@@ -33,127 +33,11 @@ import type {
 
 interface EssayWorkspaceProps {
   active: boolean;
-  selectedSubject: string;
-  selectedClass: string;
   onMeta: (meta: TabMeta) => void;
-}
-
-/**
- * Empty-state hero shown while the teacher has not picked a subject in the
- * Sidebar. Pairs with the Sidebar's pulsing dropdown — together they form a
- * "look-here" cue without resorting to a blocking modal.
- */
-function WaitingForSubjectHero() {
-  const isMobile = useIsMobile();
-  // Visualises the wizard pipeline as breadcrumb pills so a first-time
-  // teacher sees the whole flow upfront — "Chọn môn" highlighted as the
-  // current step, the rest dimmed but readable. Replaces the older
-  // single-arrow nudge that only pointed at the sidebar.
-  const flow = [
-    { label: "Chọn môn", active: true },
-    { label: "Tải đề bài" },
-    { label: "Tải bài làm" },
-    { label: "AI chấm" },
-    { label: "Duyệt" },
-  ];
-  return (
-    <div
-      style={{
-        maxWidth: 620,
-        margin: "80px auto 0",
-        padding: "40px clamp(20px, 5vw, 32px)",
-        background: T.bgCard,
-        border: `1px solid ${T.border}`,
-        borderRadius: 16,
-        boxShadow: T.shadowSoft,
-        textAlign: "center",
-      }}
-    >
-      <div
-        style={{
-          display: "inline-flex",
-          alignItems: "center",
-          justifyContent: "center",
-          width: 72,
-          height: 72,
-          borderRadius: "50%",
-          background: T.accentSoft,
-          marginBottom: 18,
-        }}
-      >
-        <Icon.Lightbulb size={36} color={T.amber} />
-      </div>
-      <h2
-        style={{
-          fontFamily: T.display,
-          fontSize: 32,
-          fontWeight: 600,
-          color: T.text,
-          margin: "0 0 16px",
-          letterSpacing: "-0.02em",
-        }}
-      >
-        Hãy chọn môn để bắt đầu chấm
-      </h2>
-      <p
-        style={{
-          fontSize: 17,
-          color: T.textSoft,
-          lineHeight: 1.65,
-          margin: "0 auto 32px",
-          maxWidth: 520,
-        }}
-      >
-        AI dùng prompt riêng và bộ nhớ HITL theo từng môn (Toán · Tin · Vật lý). Chọn đúng
-        môn để bài học không lẫn giữa các nhóm. {isMobile ? "Nhấn menu ở góc trên" : "Chọn ở thanh bên trái"} để bắt đầu.
-      </p>
-
-      {/* Wizard flow as breadcrumb pills. */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          flexWrap: "wrap",
-          gap: 6,
-          margin: "0 auto",
-        }}
-      >
-        {flow.map((step, i) => (
-          <div
-            key={step.label}
-            style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
-          >
-            <span
-              style={{
-                padding: "6px 14px",
-                fontSize: 14,
-                fontFamily: T.font,
-                borderRadius: 999,
-                border: `1px solid ${step.active ? T.accent : T.border}`,
-                background: step.active ? T.accent : "transparent",
-                color: step.active ? "#FFFDF8" : T.textMute,
-                fontWeight: step.active ? 600 : 400,
-                animation: step.active ? "subjectPrompt 1.6s ease-in-out infinite" : undefined,
-                whiteSpace: "nowrap",
-              }}
-            >
-              {step.label}
-            </span>
-            {i < flow.length - 1 && (
-              <Icon.ChevronRight size={12} color={T.textFaint} />
-            )}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
 }
 
 export function EssayWorkspace({
   active,
-  selectedSubject,
-  selectedClass,
   onMeta,
 }: EssayWorkspaceProps) {
   const lang = "vi" as const;
@@ -183,12 +67,86 @@ export function EssayWorkspace({
   const [finalScores, setFinalScores] = useState<Record<number, number>>({});
   const [maxOverrides, setMaxOverrides] = useState<Record<number, number>>({});
 
+  // Per-tab subject state. Replaces the old App-level `selectedSubject`
+  // (which was the same value across all tabs — a latent bug when the
+  // teacher graded a math paper in tab 1 then a bio paper in tab 2).
+  // `subject` is the value sent to the backend as the authoritative hint;
+  // `detected` + `confidence` reflect the most recent /api/detect-subject
+  // verdict so SubjectChip can render "Phát hiện: …" hints. `manualSubject`
+  // tracks whether the teacher overrode the auto-pick — used by the chip
+  // to show "Đã xác nhận" instead of "Tự phát hiện".
+  const [subject, setSubject] = useState<BackendSubject | null>(null);
+  const [detectedSubject, setDetectedSubject] = useState<BackendSubject | null>(null);
+  const [subjectConfidence, setSubjectConfidence] = useState<DetectConfidence | null>(null);
+  const [subjectDetecting, setSubjectDetecting] = useState(false);
+  const [subjectDetectError, setSubjectDetectError] = useState<string | null>(null);
+  const [manualSubject, setManualSubject] = useState(false);
+
+  const handleSubjectChange = useCallback((code: BackendSubject) => {
+    setSubject(code);
+    setManualSubject(true);
+  }, []);
+
+  // Re-run detection every time the task PDF changes (new upload OR file
+  // swap). Uses a ref to invalidate stale responses if the teacher uploads
+  // a second PDF before the first call resolves — only the most recent
+  // request gets to mutate state, preventing race-condition flicker.
+  const detectionSeqRef = useRef(0);
+  useEffect(() => {
+    if (!taskPdf?.dataUrl) {
+      // PDF cleared → reset everything subject-related so the chip goes
+      // back to its "Tải đề bài để phát hiện môn" idle state.
+      detectionSeqRef.current += 1;
+      setSubject(null);
+      setDetectedSubject(null);
+      setSubjectConfidence(null);
+      setSubjectDetecting(false);
+      setSubjectDetectError(null);
+      setManualSubject(false);
+      return;
+    }
+    const seq = ++detectionSeqRef.current;
+    const ctrl = new AbortController();
+    setSubjectDetecting(true);
+    setSubjectDetectError(null);
+    setManualSubject(false);
+    detectSubject({ task_pdf_b64: taskPdf.dataUrl }, { signal: ctrl.signal })
+      .then((res) => {
+        if (seq !== detectionSeqRef.current) return; // stale response
+        setDetectedSubject(res.detected);
+        setSubjectConfidence(res.confidence);
+        // Auto-apply only when the backend is confident. Low / none
+        // require an explicit click on the chip — the chip enters its
+        // amber "Xác nhận hoặc đổi" state until the teacher picks.
+        if (res.confidence === "high") {
+          setSubject(res.detected);
+        } else {
+          setSubject(null);
+        }
+      })
+      .catch((err) => {
+        if (seq !== detectionSeqRef.current) return;
+        if ((err as Error).name === "AbortError") return;
+        const msg = err instanceof ApiError ? err.detail : (err as Error).message;
+        setSubjectDetectError(msg || "Không phát hiện được môn từ file đề.");
+        setSubjectConfidence("none");
+      })
+      .finally(() => {
+        if (seq !== detectionSeqRef.current) return;
+        setSubjectDetecting(false);
+      });
+    return () => {
+      ctrl.abort();
+    };
+  }, [taskPdf?.dataUrl]);
+
+  const subjectLabel = useMemo(() => subjectLabelOf(subject), [subject]);
+
   const taskLabel = useMemo(() => taskFromPdfName(taskPdf?.name), [taskPdf]);
   const task = useMemo(
-    () => buildTaskContext(taskPdf?.name, selectedSubject, selectedClass),
-    [taskPdf, selectedSubject, selectedClass],
+    () => buildTaskContext(taskPdf?.name, subjectLabel === "—" ? "" : subjectLabel),
+    [taskPdf, subjectLabel],
   );
-  const subject = useMemo(() => subjectCodeFromSelection(selectedSubject), [selectedSubject]);
 
   // Parse grade when pipeline returns
   useEffect(() => {
@@ -266,7 +224,13 @@ export function EssayWorkspace({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [label, pipeline.phase, step]);
 
-  const canRun = !!taskPdf && !!essayImage && pipeline.phase !== "generating";
+  // Subject must be confirmed (either auto-detected at "high" confidence
+  // or explicitly picked by the teacher) before grading is allowed. Without
+  // it, the backend hint would be null and we'd silently fall back to
+  // DEFAULT_SUBJECT — exactly the failure mode auto-detection is meant to
+  // prevent. The chip's amber state nudges the teacher to click.
+  const canRun =
+    !!taskPdf && !!essayImage && !!subject && pipeline.phase !== "generating";
 
   const handleRun = useCallback(() => {
     feedbackHook.reset();
@@ -390,20 +354,6 @@ export function EssayWorkspace({
     String(t.stepDone ?? ""),
   ];
 
-  // Gate the entire wizard until a subject is chosen. The Sidebar is the
-  // single source of truth for which subject prompt the backend will use,
-  // and a missing/wrong choice silently corrupts HITL memory (lessons
-  // stamped under the wrong subject) — same root cause as the 60-row DB
-  // drift we just cleaned up. Better to require an explicit pick once per
-  // first-time session; localStorage persists it for return visits.
-  if (!selectedSubject) {
-    return (
-      <div style={{ padding: "0 clamp(16px, 4vw, 32px) 96px", display: active ? "block" : "none" }}>
-        <WaitingForSubjectHero />
-      </div>
-    );
-  }
-
   return (
     <div style={{ padding: "0 clamp(16px, 4vw, 32px) 96px", display: active ? "block" : "none" }}>
       <StepIndicator
@@ -450,6 +400,13 @@ export function EssayWorkspace({
             onSubmit={handleRun}
             canSubmit={canRun}
             t={t}
+            subject={subject}
+            detectedSubject={detectedSubject}
+            subjectConfidence={subjectConfidence}
+            subjectDetecting={subjectDetecting}
+            subjectDetectError={subjectDetectError}
+            manualSubject={manualSubject}
+            onSubjectChange={handleSubjectChange}
           />
         </ErrorBoundary>
       )}
@@ -519,7 +476,7 @@ export function EssayWorkspace({
             finalized={finalizedResult}
             isFinalizing={isFinalizing}
             finalizeError={finalizeError}
-            subjectLabel={selectedSubject}
+            subjectLabel={subjectLabel === "—" ? "" : subjectLabel}
             teacherFinalScores={finalScores}
             teacherMaxOverrides={maxOverrides}
             onFinalize={async (payload) => {

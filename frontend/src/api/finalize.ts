@@ -1,4 +1,5 @@
 import { apiPost, type RequestOptions } from "./client";
+import { emitMemoryChanged } from "../lib/memoryBus";
 import type { BackendSubject, FinalizeGradeResponse } from "../types";
 
 export interface FinalizeGradeRequest {
@@ -24,5 +25,14 @@ export function finalizeGrade(
   req: FinalizeGradeRequest,
   options?: RequestOptions,
 ): Promise<FinalizeGradeResponse> {
-  return apiPost<FinalizeGradeRequest, FinalizeGradeResponse>("/finalize-grade", req, options);
+  // /finalize-grade may or may not create a delta lesson (depends on
+  // threshold), but it always writes an approved_grade row and may
+  // back-fill correct_code on prior lessons — either way the panel's
+  // stats and rows can shift, so we refresh regardless.
+  return apiPost<FinalizeGradeRequest, FinalizeGradeResponse>("/finalize-grade", req, options).then(
+    (res) => {
+      emitMemoryChanged();
+      return res;
+    },
+  );
 }

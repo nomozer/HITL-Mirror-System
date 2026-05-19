@@ -1,4 +1,5 @@
 import { apiPost, type RequestOptions } from "./client";
+import { emitMemoryChanged } from "../lib/memoryBus";
 import type {
   AnalyzeCommentResponse,
   BackendSubject,
@@ -27,7 +28,13 @@ export function submitFeedback(
   req: FeedbackRequest,
   options?: RequestOptions,
 ): Promise<FeedbackResponse> {
-  return apiPost<FeedbackRequest, FeedbackResponse>("/feedback", req, options);
+  // Every successful /feedback writes at least one lesson (approve → 3.0
+  // or 3.5, revise → 4.0, reject → 5.0), so emit unconditionally on
+  // success. The Memory Panel listens and refetches.
+  return apiPost<FeedbackRequest, FeedbackResponse>("/feedback", req, options).then((res) => {
+    emitMemoryChanged();
+    return res;
+  });
 }
 
 export function analyzeComment(

@@ -42,20 +42,34 @@ function relativeTime(ts: number): string {
   return new Date(ts).toLocaleDateString("vi-VN");
 }
 
-// Split the "Môn X · Lớp Y · <name>" prefix that buildTaskContext prepends
-// into structured pieces:
+// Decode the task-context string that ``buildTaskContext`` produces and
+// any legacy variants still present in the localStorage cache:
+//
+//   current  : "<Môn X> · <tên đề>"                  (no class)
+//   current  : "<Môn X>" / ""                        (subject only / empty)
+//   legacy   : "Môn X · Lớp Y · <tên đề>"            (pre header-cleanup)
+//
+// Returns:
 //   body       = the essay's actual name (shown as the row title)
-//   classLabel = "Lớp 10" / "" (shown next to the subject pill)
-// Subject itself is read from entry.subject (the backend code), so we
-// only need to skip past it here. The subject segment can be multi-word
-// ("Sinh học", "Vật lý", "Hoá học") so we match ``[^·]+?`` instead of
-// ``\S+`` — the old single-token regex bailed on 2-word subjects and
-// left the entire "Môn ... · Lớp ... · ..." prefix in the title, where
-// it doubled up with the subject pill rendered right below.
+//   classLabel = "Lớp 10" / "" — only populated by legacy entries; the
+//                current header has no class pill so new entries always
+//                return "". The dropdown still renders the label when
+//                present so the teacher's older cached grades don't
+//                lose their visual breadcrumb.
+//
+// Subject itself is read from entry.subject (the backend code), so the
+// regex only needs to skip the "Môn X" prefix. The subject segment can
+// be multi-word ("Sinh học", "Vật lý", "Hoá học") so it matches
+// ``[^·]+?`` instead of ``\S+`` — the old single-token regex bailed on
+// 2-word subjects and left the entire prefix in the title.
 function parseTaskContext(task: string): { body: string; classLabel: string } {
-  const m = task.match(/^Môn\s+[^·]+?\s*·\s*(Lớp\s+\d+)\s*·\s*(.+)$/iu);
-  if (m) {
-    return { classLabel: m[1].trim(), body: m[2].trim() || "(không tên)" };
+  const legacy = task.match(/^Môn\s+[^·]+?\s*·\s*(Lớp\s+\d+)\s*·\s*(.+)$/iu);
+  if (legacy) {
+    return { classLabel: legacy[1].trim(), body: legacy[2].trim() || "(không tên)" };
+  }
+  const current = task.match(/^Môn\s+[^·]+?\s*·\s*(.+)$/iu);
+  if (current) {
+    return { classLabel: "", body: current[1].trim() || "(không tên)" };
   }
   return { classLabel: "", body: (task || "").trim() || "(không tên)" };
 }
