@@ -25,6 +25,8 @@ export type {
 
 export type {
   Lesson,
+  GradeHistoryEntry,
+  GradeHistoryResponse,
   StagedLesson,
   GenerateResponse,
   FeedbackResponse,

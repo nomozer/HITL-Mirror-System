@@ -1,6 +1,6 @@
 import { apiPost, type RequestOptions } from "./client";
 import { emitMemoryChanged } from "../lib/memoryBus";
-import type { BackendSubject, FinalizeGradeResponse } from "../types";
+import type { BackendSubject, FinalizeGradeResponse, StagedLesson } from "../types";
 
 export interface FinalizeGradeRequest {
   task: string;
@@ -19,6 +19,8 @@ export interface FinalizeGradeRequest {
   approved_grade_json: string;
   run_id: number | null;
   subject?: BackendSubject | null;
+  comment?: string;
+  staged_lessons?: StagedLesson[];
 }
 
 export function finalizeGrade(

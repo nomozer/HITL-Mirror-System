@@ -200,6 +200,9 @@ class AgentOrchestrator:
         run_id = self.memory.log_pipeline_run(
             task=task, iterations=1, auto_fixed=False,
             parent_run_id=parent_run_id,
+            grade_json=grade_str,
+            subject=str(grader_bundle.meta.get("subject") or ""),
+            lessons_used=grader_bundle.lessons_used,
         )
         self._cache_files(run_id, image_parts, task_pdf_part)
 

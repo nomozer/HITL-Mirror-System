@@ -53,6 +53,10 @@ export interface SelectionAnnotation {
   /** AI's reasoning (≤80 words). Rendered as a sub-blurb under the
    *  verdict pill so the teacher sees WHY AI agreed/disagreed. */
   analysis?: string;
+  /** Distilled reusable grading rule returned by /api/analyze-comment.
+   *  Finalize saves this into HITL memory instead of the raw teacher note
+   *  when available. */
+  lesson?: string;
   /** Teacher's override for ``verdict === "dispute"``:
    *   • undefined: pending decision (UI shows confirm buttons)
    *   • "apply":   teacher overrides AI, lesson WILL be staged

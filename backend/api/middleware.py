@@ -77,4 +77,67 @@ def make_csrf_origin_guard(
     return csrf_origin_guard
 
 
-__all__ = ["CSRF_UNSAFE_METHODS", "normalize_origin", "make_csrf_origin_guard"]
+def make_request_size_guard(
+    max_bytes: int,
+) -> Callable[[Request, Callable[[Request], Awaitable]], Awaitable]:
+    """Reject oversized API requests before the body is read.
+
+    The grading endpoints carry base64 PDF/image payloads, so the limit is
+    intentionally generous. It still prevents accidental or hostile requests
+    from pushing the process into memory pressure.
+    """
+
+    async def request_size_guard(request: Request, call_next):
+        if max_bytes > 0 and request.url.path.startswith("/api/"):
+            raw_len = request.headers.get("content-length")
+            if raw_len:
+                try:
+                    content_length = int(raw_len)
+                except ValueError:
+                    content_length = 0
+                if content_length > max_bytes:
+                    logger.warning(
+                        "Rejected oversized API request path=%s bytes=%s limit=%s",
+                        request.url.path,
+                        content_length,
+                        max_bytes,
+                    )
+                    return JSONResponse(
+                        status_code=413,
+                        content={"detail": "Request body too large."},
+                    )
+        return await call_next(request)
+
+    return request_size_guard
+
+
+def make_security_headers_middleware() -> Callable[
+    [Request, Callable[[Request], Awaitable]], Awaitable
+]:
+    """Attach conservative browser security headers to every response."""
+
+    async def security_headers(request: Request, call_next):
+        response = await call_next(request)
+        headers = response.headers
+        headers.setdefault("X-Content-Type-Options", "nosniff")
+        headers.setdefault("X-Frame-Options", "DENY")
+        headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        headers.setdefault(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=(), payment=()",
+        )
+        if request.url.path.startswith("/api/"):
+            headers.setdefault("Cache-Control", "no-store")
+            headers.setdefault("Pragma", "no-cache")
+        return response
+
+    return security_headers
+
+
+__all__ = [
+    "CSRF_UNSAFE_METHODS",
+    "normalize_origin",
+    "make_csrf_origin_guard",
+    "make_request_size_guard",
+    "make_security_headers_middleware",
+]

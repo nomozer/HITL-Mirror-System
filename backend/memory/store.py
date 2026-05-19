@@ -17,7 +17,9 @@ Research Project: Tác tử AI hỗ trợ chấm điểm tự luận đa phươn
 from __future__ import annotations
 
 import datetime
+import json
 import logging
+import re
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -106,6 +108,11 @@ class PipelineRun(Base):
     # Links re-grade runs into a chain: run #1 → run #2 → run #3 (approved).
     # NULL for the first grading of an essay.
     parent_run_id: Mapped[int] = mapped_column(Integer, nullable=True, default=None)
+    # Full Grader JSON for this run. Stored server-side so the "Bài đã chấm"
+    # history is not a browser-local source of truth.
+    grade_json: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    subject: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    lessons_used_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
 
 
 class ApprovedGrade(Base):
@@ -135,6 +142,65 @@ class ApprovedGrade(Base):
 # ---------------------------------------------------------------------------
 
 CHROMA_COLLECTION = "hitl_grading_lessons_v1"
+
+
+def _timestamp_ms(value: datetime.datetime | None) -> int:
+    if value is None:
+        return 0
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=datetime.timezone.utc)
+    return int(value.timestamp() * 1000)
+
+
+def _parse_json_object(raw: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw or "{}")
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _parse_json_array(raw: str) -> list[dict[str, Any]]:
+    try:
+        parsed = json.loads(raw or "[]")
+    except Exception:
+        return []
+    return [x for x in parsed if isinstance(x, dict)] if isinstance(parsed, list) else []
+
+
+_CAU_RE = re.compile(r"^\s*C[âa]u\s+(\d+)", re.IGNORECASE)
+
+
+def _question_number(raw: str, fallback: int) -> int:
+    match = _CAU_RE.match(raw or "")
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return fallback
+    return fallback
+
+
+def _teacher_overrides_from_approved_grade(
+    approved_grade_json: str,
+) -> tuple[dict[int, float], dict[int, float]]:
+    grade = _parse_json_object(approved_grade_json)
+    pqf = grade.get("per_question_feedback")
+    if not isinstance(pqf, list):
+        return {}, {}
+    final_scores: dict[int, float] = {}
+    max_overrides: dict[int, float] = {}
+    for i, item in enumerate(pqf):
+        if not isinstance(item, dict):
+            continue
+        num = _question_number(str(item.get("question") or ""), i + 1)
+        score = item.get("score")
+        if isinstance(score, (int, float)):
+            final_scores[num] = float(score)
+        max_points = item.get("max_points")
+        if isinstance(max_points, (int, float)):
+            max_overrides[num] = float(max_points)
+    return final_scores, max_overrides
 
 
 class MemoryManager:
@@ -198,6 +264,19 @@ class MemoryManager:
                     )
                 )
             logger.info("Migrated legacy 'lessons' table: added 'subject' column")
+
+        if inspector.has_table("pipeline_runs"):
+            run_columns = {c["name"] for c in inspector.get_columns("pipeline_runs")}
+            run_migrations = {
+                "grade_json": "ALTER TABLE pipeline_runs ADD COLUMN grade_json TEXT NOT NULL DEFAULT ''",
+                "subject": "ALTER TABLE pipeline_runs ADD COLUMN subject TEXT NOT NULL DEFAULT ''",
+                "lessons_used_json": "ALTER TABLE pipeline_runs ADD COLUMN lessons_used_json TEXT NOT NULL DEFAULT '[]'",
+            }
+            for column, ddl in run_migrations.items():
+                if column not in run_columns:
+                    with self._engine.begin() as conn:
+                        conn.execute(text(ddl))
+                    logger.info("Migrated legacy 'pipeline_runs' table: added '%s' column", column)
 
         # UNIQUE INDEX on approved_grades — prevents the finalize_grade race
         # where two concurrent requests both pass "not found" and both
@@ -442,6 +521,9 @@ class MemoryManager:
         iterations: int = 1,
         auto_fixed: bool = False,
         parent_run_id: int | None = None,
+        grade_json: str = "",
+        subject: str = "",
+        lessons_used: list[dict[str, Any]] | None = None,
     ) -> int:
         """Record a pipeline execution for research metrics.
 
@@ -449,16 +531,81 @@ class MemoryManager:
             parent_run_id: ID of the previous run when this is a teacher-
                            triggered re-grade, forming a chain for analysis.
         """
+        try:
+            lessons_used_json = json.dumps(lessons_used or [], ensure_ascii=False)
+        except TypeError:
+            lessons_used_json = "[]"
         with self._get_session() as session:
             run = PipelineRun(
                 task=task,
                 iterations=iterations,
                 auto_fixed=int(auto_fixed),
                 parent_run_id=parent_run_id,
+                grade_json=grade_json,
+                subject=subject,
+                lessons_used_json=lessons_used_json,
             )
             session.add(run)
             session.flush()
             return run.id
+
+    def list_grade_history(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Return recent grade runs for the workspace history dropdown.
+
+        The browser used to persist this in localStorage. Keeping it here
+        makes SQLite the source of truth and lets finalized teacher scores
+        survive browser/cache clears.
+        """
+        with self._get_session() as session:
+            runs = (
+                session.query(PipelineRun)
+                .order_by(PipelineRun.timestamp.desc())
+                .limit(max(1, min(limit, 100)))
+                .all()
+            )
+            run_ids = [run.id for run in runs]
+            approved_rows = (
+                session.query(ApprovedGrade)
+                .filter(ApprovedGrade.run_id.in_(run_ids))
+                .order_by(ApprovedGrade.timestamp.desc())
+                .all()
+                if run_ids
+                else []
+            )
+            approved_by_run: dict[int, ApprovedGrade] = {}
+            for row in approved_rows:
+                if row.run_id is not None and row.run_id not in approved_by_run:
+                    approved_by_run[row.run_id] = row
+
+        items: list[dict[str, Any]] = []
+        for run in runs:
+            approved = approved_by_run.get(run.id)
+            code = run.grade_json or (approved.grade_json if approved else "")
+            if not code:
+                continue
+            final_scores: dict[int, float] = {}
+            max_overrides: dict[int, float] = {}
+            if approved and approved.grade_json:
+                final_scores, max_overrides = _teacher_overrides_from_approved_grade(
+                    approved.grade_json
+                )
+            items.append(
+                {
+                    "id": str(run.id),
+                    "ts": _timestamp_ms(approved.timestamp if approved else run.timestamp),
+                    "task": run.task,
+                    "subject": run.subject or None,
+                    "response": {
+                        "code": code,
+                        "lessons_used": _parse_json_array(run.lessons_used_json),
+                        "run_id": run.id,
+                    },
+                    "finalScores": final_scores or None,
+                    "maxOverrides": max_overrides or None,
+                }
+            )
+        items.sort(key=lambda item: int(item.get("ts") or 0), reverse=True)
+        return items
 
     def save_approved_grade(
         self, task: str, grade_json: str, run_id: int | None = None

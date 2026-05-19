@@ -27,6 +27,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +41,14 @@ for _stream in (sys.stdout, sys.stderr):
 
 # uvicorn is launched from backend/, so direct imports (no "backend." prefix).
 from api.heartbeat import router as heartbeat_router, start_watchdog
+from api.history import router as history_router, attach_history_memory
 from api.memory import router as memory_router, attach_memory
-from api.middleware import make_csrf_origin_guard, normalize_origin
+from api.middleware import (
+    make_csrf_origin_guard,
+    make_request_size_guard,
+    make_security_headers_middleware,
+    normalize_origin,
+)
 from api.schemas import (
     AnalyzeCommentRequest,
     AnalyzeCommentResponse,
@@ -80,6 +87,7 @@ start_watchdog()
 
 _DEFAULT_CORS_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000"
 _BACKEND_DEV_ORIGINS = ("http://localhost:8000", "http://127.0.0.1:8000")
+_DEFAULT_ALLOWED_HOSTS = "localhost,127.0.0.1"
 
 
 def _split_csv_env(name: str, default: str = "") -> list[str]:
@@ -95,6 +103,7 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 
 CORS_ORIGINS = _split_csv_env("CORS_ORIGINS", _DEFAULT_CORS_ORIGINS)
+ALLOWED_HOSTS = _split_csv_env("ALLOWED_HOSTS", _DEFAULT_ALLOWED_HOSTS)
 CSRF_TRUSTED_ORIGINS = tuple(
     dict.fromkeys(
         [
@@ -109,6 +118,8 @@ CSRF_TRUSTED_ORIGINS = tuple(
 )
 CSRF_ORIGIN_CHECK_ENABLED = _env_flag("CSRF_ORIGIN_CHECK", "1")
 CORS_ALLOW_CREDENTIALS = _env_flag("CORS_ALLOW_CREDENTIALS", "0")
+MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(40 * 1024 * 1024)))
+PROMPT_LOGS_ENABLED = _env_flag("HITL_PROMPT_LOGS", "0")
 
 
 @asynccontextmanager
@@ -123,6 +134,9 @@ app = FastAPI(
     description="Backend for the Human-in-the-Loop multimodal essay-grading system",
 )
 
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+app.middleware("http")(make_security_headers_middleware())
+app.middleware("http")(make_request_size_guard(MAX_REQUEST_BODY_BYTES))
 app.middleware("http")(
     make_csrf_origin_guard(
         CSRF_TRUSTED_ORIGINS,
@@ -134,24 +148,30 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
     allow_credentials=CORS_ALLOW_CREDENTIALS,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
 
 app.include_router(heartbeat_router)
 app.include_router(memory_router)
+app.include_router(history_router)
 
 # Singletons: memory drives prompt retrieval, prompt drives grading.
 memory = MemoryManager()
 prompt_orch = PromptOrchestrator(
     memory,
     k_lessons=3,
-    log_dir=Path(__file__).resolve().parent / "data" / "prompt_logs",
+    log_dir=(
+        Path(__file__).resolve().parent / "data" / "prompt_logs"
+        if PROMPT_LOGS_ENABLED
+        else None
+    ),
 )
 orchestrator = AgentOrchestrator(memory=memory, prompt_orchestrator=prompt_orch)
 
 # Inject the singleton into the memory router so its handlers can use it.
 attach_memory(memory)
+attach_history_memory(memory)
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +189,12 @@ def _pipeline_http_error(exc: Exception) -> HTTPException:
     detail = str(exc)
     status_code = 504 if looks_like_timeout(detail) else 502
     logger.exception("Pipeline error (returning %d): %s", status_code, detail)
-    return HTTPException(status_code=status_code, detail=detail)
+    safe_detail = (
+        "AI upstream timed out. Please try again."
+        if status_code == 504
+        else "AI upstream request failed. Please check backend logs."
+    )
+    return HTTPException(status_code=status_code, detail=safe_detail)
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +224,8 @@ async def generate(req: GenerateRequest):
             lessons_used=result.lessons_used,
             run_id=result.run_id,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise _pipeline_http_error(exc) from exc
 
@@ -260,6 +287,8 @@ async def regrade(req: RegradeRequest):
             run_id=result.run_id,
             lesson_id=lesson_id,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise _pipeline_http_error(exc) from exc
 
@@ -430,12 +459,52 @@ async def finalize_grade(req: FinalizeGradeRequest):
     # Persist the approved grade (research-grade audit log). Idempotent via
     # the UNIQUE INDEX on approved_grades — no need to pre-check.
     approved_id: int | None = None
-    if req.approved_grade_json.strip():
+    approved_grade_json = req.approved_grade_json.strip()
+    if approved_grade_json:
         approved_id = memory.save_approved_grade(
             task=req.task,
-            grade_json=req.approved_grade_json.strip(),
+            grade_json=approved_grade_json,
             run_id=req.run_id,
         )
+        # Finalize is the one place that knows the teacher-approved JSON.
+        # Back-fill older revise/reject lessons here so Step 4 no longer
+        # needs to call /api/feedback with a premature "approve" signal.
+        memory.backfill_correct_code(task=req.task, correct_code=approved_grade_json)
+
+    # Save review annotations atomically with finalization. Prefer the
+    # distilled per-question lessons staged by the frontend; fall back to an
+    # aggregate comment only when no structured lessons were staged.
+    comment_lesson_ids: list[int] = []
+
+    def _save_comment_lesson(text: str, score: float) -> int:
+        existing_id = memory.find_recent_lesson(
+            task=req.task,
+            lesson_text=text,
+            feedback_score=score,
+            within_seconds=DEDUP_WINDOW_SECONDS,
+        )
+        if existing_id is not None:
+            return existing_id
+        return prompt_orch.ingest_feedback(
+            task=req.task,
+            wrong_code="",
+            correct_code=approved_grade_json,
+            lesson_text=text,
+            score=score,
+            subject=req.subject,
+        )
+
+    if req.staged_lessons:
+        for staged in req.staged_lessons:
+            text = staged.lesson_text.strip()
+            if not text:
+                continue
+            prefix = f"[{staged.question_ref}] " if staged.question_ref else ""
+            comment_lesson_ids.append(
+                _save_comment_lesson(f"{prefix}{text}", 3.5)
+            )
+    elif req.comment.strip():
+        comment_lesson_ids.append(_save_comment_lesson(req.comment.strip(), 3.0))
 
     # Auto-generate a lesson capturing the numeric correction so future
     # grading runs can learn the AI's tendency. Fires if ANY axis has a
@@ -473,7 +542,7 @@ async def finalize_grade(req: FinalizeGradeRequest):
             delta_lesson_id = prompt_orch.ingest_feedback(
                 task=req.task,
                 wrong_code="",
-                correct_code=req.approved_grade_json.strip(),
+                correct_code=approved_grade_json,
                 lesson_text=lesson_text,
                 score=4.0,  # stronger than per-Q annotations (3.5), weaker than reject (5.0)
                 subject=req.subject,
@@ -501,11 +570,13 @@ async def finalize_grade(req: FinalizeGradeRequest):
         task=req.task,
         approved_id=approved_id,
         delta_lesson_id=delta_lesson_id,
+        comment_lesson_ids=comment_lesson_ids,
         deltas=deltas_out,
     )
     return FinalizeGradeResponse(
         approved_id=approved_id,
         delta_lesson_id=delta_lesson_id,
+        comment_lesson_ids=comment_lesson_ids,
         deltas=deltas_out,
         message=message,
     )

@@ -22,6 +22,20 @@ export interface GenerateResponse {
   run_id: number | null;
 }
 
+export interface GradeHistoryEntry {
+  id: string;
+  ts: number;
+  task: string;
+  subject: string | null;
+  response: GenerateResponse;
+  finalScores?: Record<number, number> | null;
+  maxOverrides?: Record<number, number> | null;
+}
+
+export interface GradeHistoryResponse {
+  items: GradeHistoryEntry[];
+}
+
 export interface FeedbackResponse {
   action: FeedbackAction;
   saved: boolean;
@@ -47,6 +61,7 @@ export interface AnalyzeCommentResponse {
 export interface FinalizeGradeResponse {
   approved_id: number | null;
   delta_lesson_id: number | null;
+  comment_lesson_ids: number[];
   deltas: Record<string, number>;
   message: string;
 }

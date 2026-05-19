@@ -1,9 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  getCachedGradeById,
-  updateCachedGradeTeacherData,
-  useAgentPipeline,
-} from "../../hooks/useAgentPipeline";
+import { useAgentPipeline } from "../../hooks/useAgentPipeline";
 import { useFeedback } from "../../hooks/useFeedback";
 import { ApiError, detectSubject, finalizeGrade, type DetectConfidence } from "../../api";
 import { T } from "../../theme/tokens";
@@ -30,8 +26,10 @@ import type {
   EssayFile,
   FinalizedResult,
   Grade,
+  GradeHistoryEntry,
   RubricScores,
   SelectionAnnotation,
+  StagedLesson,
   TabMeta,
   TaskFile,
 } from "../../types";
@@ -39,6 +37,41 @@ import type {
 interface EssayWorkspaceProps {
   active: boolean;
   onMeta: (meta: TabMeta) => void;
+}
+
+function buildAnnotationFinalizePayload(annotations: SelectionAnnotation[]): {
+  stagedLessons: StagedLesson[];
+  aggregateComment: string;
+  skippedCount: number;
+} {
+  const nonEmpty = annotations.filter((a) => a.comment.trim().length > 0);
+  const skipped = nonEmpty.filter(
+    (a) => a.verdict === "dispute" && a.disputeDecision !== "apply",
+  );
+  const accepted = nonEmpty.filter(
+    (a) => !(a.verdict === "dispute" && a.disputeDecision !== "apply"),
+  );
+
+  const stagedLessons: StagedLesson[] = accepted.map((a) => {
+    const lesson = (a.lesson || "").trim();
+    const fallback = a.quote
+      ? `"${a.quote.trim()}" — ${a.comment.trim()}`
+      : a.comment.trim();
+    return {
+      lesson_text: lesson || fallback,
+      question_ref: `Câu ${a.cau}`,
+    };
+  });
+
+  const aggregateComment = accepted
+    .map((a) =>
+      a.quote
+        ? `[Câu ${a.cau}] "${a.quote.trim()}" — ${a.comment.trim()}`
+        : `[Câu ${a.cau}] ${a.comment.trim()}`,
+    )
+    .join("\n");
+
+  return { stagedLessons, aggregateComment, skippedCount: skipped.length };
 }
 
 export function EssayWorkspace({
@@ -168,19 +201,11 @@ export function EssayWorkspace({
       setFinalizedResult(null);
       setIsFinalizing(false);
       setFinalizeError(null);
-      // Restore teacher overrides if this grade was reloaded from cache
-      // (history "Xem xét" / "Chấm lại"). The cache stores the teacher's
-      // finalScores + maxOverrides at finalize time, so re-opening shows
-      // the locked numbers instead of falling back to AI's. Fresh grades
-      // (not in cache) reset to {} — without the reset, a teacher who
-      // edited câu scores then regraded would see old overrides applied
-      // against new AI scores, producing nonsense deltas in step 5.
-      const cached =
-        pipeline.runId != null
-          ? getCachedGradeById(String(pipeline.runId))
-          : null;
-      setFinalScores(cached?.finalScores ?? {});
-      setMaxOverrides(cached?.maxOverrides ?? {});
+      // Restore teacher overrides if this grade was reloaded from backend
+      // history. Fresh grades reset to {} so old per-câu edits cannot leak
+      // into a new AI response.
+      setFinalScores(pipeline.historyFinalScores ?? {});
+      setMaxOverrides(pipeline.historyMaxOverrides ?? {});
       setTeacherAnnotations([]);
       // Reset the step high-water-mark — a regrade restarts the review
       // arc, so the indicator shouldn't claim step 5 is still "done"
@@ -188,7 +213,12 @@ export function EssayWorkspace({
       setMaxStepReached((prev) => Math.max(prev, 3));
       setStep((s) => stepAfterGrade(s));
     }
-  }, [pipeline.code]);
+  }, [
+    pipeline.code,
+    pipeline.runId,
+    pipeline.historyFinalScores,
+    pipeline.historyMaxOverrides,
+  ]);
 
   // Track the highest step the teacher reaches. Plain ratchet — only
   // moves upward, never resets except on a fresh grade (above).
@@ -201,17 +231,17 @@ export function EssayWorkspace({
     setStep((s) => nextStepOnPhaseChange(s, pipeline.phase, pipeline.error));
   }, [pipeline.phase, pipeline.error]);
 
-  // Listen for "load cached grade" requests from the header dropdown. Only
+  // Listen for "load grade history" requests from the header dropdown. Only
   // the active tab reacts so clicking a history entry routes to the tab
   // the teacher is currently looking at (mirrors Chrome's "open in current
-  // tab" behavior). Event detail carries the grade id from the cache AND
+  // tab" behavior). Event detail carries the backend history entry AND
   // an optional target step (3 = Xem xét, 4 = Chấm lại, 5 = Xong) — the
   // dropdown surfaces three jump buttons per entry. Defaults to 3 when
   // the field is omitted so older event payloads stay compatible.
   //
   // We always force the step explicitly after a load. The normal grade
   // flow goes step 1 → 2 (loading) → 3 (review), and ``stepAfterGrade``
-  // (workspace.logic) only advances from 2 or 4. Cached loads dispatch
+  // (workspace.logic) only advances from 2 or 4. History loads dispatch
   // PIPELINE_SUCCESS directly without ever entering step 2, so without
   // this manual setStep the workspace would silently update the underlying
   // grade state but leave the user stuck on the Upload screen.
@@ -220,10 +250,11 @@ export function EssayWorkspace({
   useEffect(() => {
     if (!active) return;
     const handler = (e: Event) => {
-      const detail = (e as CustomEvent<{ id: string; step?: 3 | 4 | 5 }>).detail;
-      const id = detail?.id;
-      if (typeof id !== "string" || !id) return;
-      const ok = pipeline.loadCachedById(id);
+      const detail =
+        (e as CustomEvent<{ entry: GradeHistoryEntry; step?: 3 | 4 | 5 }>).detail;
+      const entry = detail?.entry;
+      if (!entry || typeof entry.response?.code !== "string") return;
+      const ok = pipeline.loadHistoryEntry(entry);
       if (ok) {
         feedbackHook.reset();
         setIsFinalizing(false);
@@ -330,11 +361,27 @@ export function EssayWorkspace({
       // phantom deltas any time AI's rubric overall ≠ its per-câu sum.
       const teacherOverall = toNum(payload?.overall);
       const aiOverall = hasRealPqf ? sumAiPq : toNum(grade?.overall);
+      const finalPerQuestionFeedback = pqf.map((q, i) => {
+        const parsed = parseCauHeader(q.question ?? "", i + 1);
+        const aiScore =
+          typeof q.score === "number" && Number.isFinite(q.score) ? q.score : 0;
+        const nextScore = finalScores[parsed.num] ?? aiScore;
+        const nextMax = maxOverrides[parsed.num] ?? q.max_points;
+        return {
+          ...q,
+          score: nextScore,
+          ...(typeof nextMax === "number" && Number.isFinite(nextMax)
+            ? { max_points: nextMax }
+            : {}),
+        };
+      });
       const finalGrade = {
         ...(grade || {}),
         scores: { ...(grade?.scores || {}), ...teacherScores },
         overall: teacherOverall ?? grade?.overall ?? null,
+        per_question_feedback: finalPerQuestionFeedback,
       };
+      const annotationPayload = buildAnnotationFinalizePayload(teacherAnnotations);
       try {
         return await finalizeGrade({
           task,
@@ -348,6 +395,8 @@ export function EssayWorkspace({
           approved_grade_json: JSON.stringify(finalGrade),
           run_id: pipeline.runId,
           subject,
+          comment: annotationPayload.aggregateComment,
+          staged_lessons: annotationPayload.stagedLessons,
         });
       } catch (err) {
         console.warn("[HITL] finalize-grade persist failed:", err);
@@ -361,7 +410,17 @@ export function EssayWorkspace({
         throw err;
       }
     },
-    [grade, task, lang, pipeline.runId, subject, finalScores, t],
+    [
+      grade,
+      task,
+      lang,
+      pipeline.runId,
+      subject,
+      finalScores,
+      maxOverrides,
+      teacherAnnotations,
+      t,
+    ],
   );
 
   const displayStep = deriveDisplayStep(step);
@@ -480,11 +539,6 @@ export function EssayWorkspace({
               setFinalScores={setFinalScores}
               maxOverrides={maxOverrides}
               setMaxOverrides={setMaxOverrides}
-              feedbackHook={feedbackHook}
-              task={task}
-              pipelineCode={pipeline.code}
-              runId={pipeline.runId}
-              subject={subject}
               teacherAnnotations={teacherAnnotations}
             />
           </ErrorBoundary>
@@ -508,32 +562,13 @@ export function EssayWorkspace({
               setFinalizeError(null);
               try {
                 const resp = await persistFinalizedGrade(payload);
-                // Persist teacher overrides into the local history cache
-                // so "Xem xét" / "Chấm lại" re-opens the grade with the
-                // teacher's locked scores, not AI's original numbers.
-                // Keyed by run_id which is the cache id used everywhere.
-                if (pipeline.runId != null) {
-                  updateCachedGradeTeacherData(
-                    String(pipeline.runId),
-                    finalScores,
-                    maxOverrides,
-                  );
-                }
-                // Counts mirror the anti-poisoning gate in
-                // RegradeMockup.handleFinish: disputed-and-skipped
-                // comments are NOT staged into HITL memory, the rest are.
-                const nonEmpty = teacherAnnotations.filter(
-                  (a) => a.comment.trim().length > 0,
-                );
-                const skipped = nonEmpty.filter(
-                  (a) =>
-                    a.verdict === "dispute" && a.disputeDecision !== "apply",
-                ).length;
+                const annotationPayload =
+                  buildAnnotationFinalizePayload(teacherAnnotations);
                 setFinalizedResult({
                   ...payload,
                   finalizedAt: new Date().toISOString(),
-                  commentsSavedCount: nonEmpty.length - skipped,
-                  commentsSkippedCount: skipped,
+                  commentsSavedCount: resp?.comment_lesson_ids?.length ?? 0,
+                  commentsSkippedCount: annotationPayload.skippedCount,
                   deltaLessonId: resp?.delta_lesson_id ?? null,
                   deltas: resp?.deltas,
                 });

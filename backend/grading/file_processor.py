@@ -18,6 +18,7 @@ import base64
 import binascii
 import io
 import logging
+import os
 from typing import Any
 
 import fitz
@@ -30,6 +31,10 @@ logger = logging.getLogger(__name__)
 _MAX_IMAGE_EDGE = 1600        # px on the longest edge
 _JPEG_QUALITY = 80            # re-encoded JPEG quality
 _COMPRESS_THRESHOLD = 400_000 # 400 KB: skip compression below this size
+_MAX_UPLOAD_BYTES = int(os.getenv("HITL_MAX_UPLOAD_BYTES", str(30 * 1024 * 1024)))
+_MAX_PDF_PAGES = int(os.getenv("HITL_MAX_PDF_PAGES", "30"))
+_ALLOWED_ESSAY_MIME_PREFIXES = ("image/",)
+_ALLOWED_ESSAY_MIMES = {"application/pdf"}
 
 
 def _decode_image(image_b64: str | None) -> dict[str, Any] | None:
@@ -44,17 +49,41 @@ def _decode_image(image_b64: str | None) -> dict[str, Any] | None:
         return None
     payload = image_b64.strip()
     mime = "image/png"
+    has_explicit_mime = False
     if payload.startswith("data:"):
         try:
             header, payload = payload.split(",", 1)
             mime = header.split(";")[0].removeprefix("data:") or mime
+            has_explicit_mime = True
         except ValueError:
             pass
     try:
         raw = base64.b64decode(payload, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise ValueError(f"Invalid base64 essay image: {exc}") from exc
+    if _MAX_UPLOAD_BYTES > 0 and len(raw) > _MAX_UPLOAD_BYTES:
+        raise ValueError(
+            f"Uploaded file is too large ({len(raw)} bytes; max {_MAX_UPLOAD_BYTES})."
+        )
+    if not has_explicit_mime:
+        if raw.startswith(b"%PDF-"):
+            mime = "application/pdf"
+        elif raw.startswith(b"\xff\xd8\xff"):
+            mime = "image/jpeg"
+        elif raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            mime = "image/png"
+        elif raw.startswith(b"GIF87a") or raw.startswith(b"GIF89a"):
+            mime = "image/gif"
+        elif raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+            mime = "image/webp"
     return {"mime_type": mime, "data": raw}
+
+
+def _is_allowed_essay_mime(mime: str) -> bool:
+    folded = (mime or "").lower()
+    return folded in _ALLOWED_ESSAY_MIMES or any(
+        folded.startswith(prefix) for prefix in _ALLOWED_ESSAY_MIME_PREFIXES
+    )
 
 
 def _compress_image(part: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -110,6 +139,8 @@ def _render_pdf_pages(raw: bytes) -> list[dict[str, Any]]:
     doc = fitz.open(stream=raw, filetype="pdf")
     try:
         logger.info("[HITL] Processing multi-page PDF: %d pages", len(doc))
+        if _MAX_PDF_PAGES > 0 and len(doc) > _MAX_PDF_PAGES:
+            raise ValueError(f"PDF has too many pages ({len(doc)}; max {_MAX_PDF_PAGES}).")
         for page in doc:
             # page.rect is in PDF points (72 DPI) — equals the default
             # pixmap dimensions in pixels, so we can skip the wasted
@@ -143,6 +174,8 @@ async def process_input_file(image_b64: str | None) -> list[dict[str, Any]]:
 
     mime = decoded.get("mime_type", "")
     raw = decoded["data"]
+    if not _is_allowed_essay_mime(mime):
+        raise ValueError(f"Unsupported upload MIME type: {mime or 'unknown'}")
 
     if "pdf" in mime.lower():
         try:
@@ -163,7 +196,13 @@ def decode_task_pdf(task_pdf_b64: str | None) -> dict[str, Any] | None:
     Kept raw so Gemini can use its native PDF reasoning on the rubric
     instead of page-by-page OCR.
     """
-    return _decode_image(task_pdf_b64)
+    decoded = _decode_image(task_pdf_b64)
+    if decoded is None:
+        return None
+    mime = decoded.get("mime_type", "").lower()
+    if "pdf" not in mime:
+        raise ValueError("Task prompt must be a PDF.")
+    return decoded
 
 
 # Default page cap for subject-detection text extraction. Two pages is

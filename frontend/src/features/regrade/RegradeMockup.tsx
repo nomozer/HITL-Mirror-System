@@ -8,13 +8,10 @@ import {
   splitTranscriptByCau,
 } from "../../lib/grade";
 import { i18n } from "../../i18n";
-import type { UseFeedbackResult } from "../../hooks/useFeedback";
 import type {
-  BackendSubject,
   EssayFile,
   Grade,
   SelectionAnnotation,
-  StagedLesson,
 } from "../../types";
 
 // ---------------------------------------------------------------------------
@@ -203,9 +200,8 @@ function deriveReview(grade: Grade | null | undefined): typeof MOCK_REGRADE {
 export interface RegradeMockupProps {
   /** Back action — go to step 3 to re-read AI's review. */
   onPrev?: () => void;
-  /** Forward action — fired ONLY after the feedback POST succeeds (or
-   *  is no-op-skipped) so step 5 never opens on a half-saved HITL
-   *  state. Caller navigates to step 5 here. */
+  /** Forward action — moves to Step 5. HITL memory is saved atomically
+   *  with the final grade from Step 5, not from this review screen. */
   onFinish?: () => void;
   /** Live grade payload from the agent pipeline. Used to derive per-câu
    *  rows (max_points, score, good_points, errors) + the student work
@@ -224,25 +220,10 @@ export interface RegradeMockupProps {
    *  points). Same lift rationale as finalScores. */
   maxOverrides: Record<number, number>;
   setMaxOverrides: React.Dispatch<React.SetStateAction<Record<number, number>>>;
-  /** HITL feedback hook shared with step 3 — owns POST /api/feedback.
-   *  Step 4 fires action="approve" with staged chat lessons +
-   *  aggregated teacher notes on "Hoàn tất bài này" so the HITL memory
-   *  learns from this review round even though the teacher never
-   *  pressed an explicit "Duyệt" button. */
-  feedbackHook: UseFeedbackResult;
-  /** Inputs threaded through to the feedback POST body — the workspace
-   *  is the source of truth for all of these (task context, the AI
-   *  grade JSON the teacher is reacting to, the pipeline run id, and
-   *  the resolved backend subject code). */
-  task: string;
-  pipelineCode: string | null;
-  runId: number | null;
-  subject: BackendSubject | null;
   /** Read-only mirror of teacher's step 3 Word-style annotations
    *  (highlight + comment anchored to a quote). Surfaced next to each
    *  câu's score input so the teacher can recall their independent
-   *  judgment when finalizing. Also used to build the staged lessons
-   *  for /api/feedback on "Hoàn tất bài này". */
+   *  judgment when finalizing. Step 5 saves them with the final grade. */
   teacherAnnotations?: SelectionAnnotation[];
 }
 
@@ -255,11 +236,6 @@ export function RegradeMockup({
   setFinalScores,
   maxOverrides,
   setMaxOverrides,
-  feedbackHook,
-  task,
-  pipelineCode,
-  runId,
-  subject,
   teacherAnnotations,
 }: RegradeMockupProps) {
   // Derive the review payload: real grade data when the pipeline produced
@@ -297,68 +273,13 @@ export function RegradeMockup({
   const collapseAll = () => setExpandedQs(new Set());
   const allExpanded = expandedQs.size === review.questions.length;
 
-  // "Hoàn tất bài này" → submit HITL feedback (approve) BEFORE navigating
-  // to step 5, so the teacher's step 3 "đối soát" annotations actually
-  // reach the memory store. Backend priorities (from CLAUDE.md):
-  //   • staged per-câu lessons (3.5) > aggregated comment (3.0) > raw text
-  //   • approve also back-fills correct_code on earlier lessons for the
-  //     same task — useful even if there are no annotations.
-  // We POST even when annotations are empty: the back-fill alone is worth
-  // recording. Score deltas separately persist via /api/finalize-grade on
-  // step 5 (delta-lesson threshold = 0.10 overall).
-  const handleFinish = useCallback(async () => {
-    if (feedbackHook.isSubmitting) return;
-
-    // Anti-poisoning gate: only stage comments that either (a) AI
-    // concurred with (agree | partial), or (b) AI disputed but teacher
-    // explicitly chose "Vẫn lưu". Pending verdicts (network failure /
-    // not yet analyzed) fall through optimistically so a slow API
-    // doesn't lose the teacher's note.
-    const anns = (teacherAnnotations ?? []).filter((a) => {
-      if (!a.comment.trim()) return false;
-      if (a.verdict === "dispute" && a.disputeDecision !== "apply") {
-        return false;
-      }
-      return true;
-    });
-    // Each annotation becomes a staged lesson. Quote is included as
-    // context so the memory retrieval can rank by both the comment and
-    // the snippet the teacher reacted to.
-    const stagedLessons: StagedLesson[] = anns.map((a) => ({
-      lesson_text: a.quote
-        ? `"${a.quote.trim()}" — ${a.comment.trim()}`
-        : a.comment.trim(),
-      question_ref: `Câu ${a.cau}`,
-    }));
-
-    const aggregatedNote = anns
-      .map((a) =>
-        a.quote
-          ? `[Câu ${a.cau}] "${a.quote.trim()}" — ${a.comment.trim()}`
-          : `[Câu ${a.cau}] ${a.comment.trim()}`,
-      )
-      .join("\n");
-
-    const res = await feedbackHook.submit({
-      action: "approve",
-      comment: aggregatedNote,
-      task,
-      wrongCode: pipelineCode || "",
-      runId,
-      stagedLessons,
-      subject,
-    });
-
-    if (res && onFinish) onFinish();
-  }, [
-    teacherAnnotations,
-    feedbackHook,
-    onFinish,
-    pipelineCode,
-    runId,
-    subject,
-    task,
-  ]);
+  // "Hoàn tất bài này" is now pure navigation. Saving HITL lessons in Step
+  // 4 used to mark the AI's original grade as approved before the teacher
+  // finalized score edits. Step 5 has the complete final grade, so it owns
+  // the single atomic save to /api/finalize-grade.
+  const handleFinish = useCallback(() => {
+    onFinish?.();
+  }, [onFinish]);
 
   // Resolve the cap for a câu: đề-specified first, teacher override
   // second, else undefined (free input).
@@ -469,95 +390,51 @@ export function RegradeMockup({
                 / {review.maxTotal.toFixed(1)}đ
               </span>
               <span style={{ color: T.textFaint }}> · </span>
-              Mỗi thay đổi sẽ lưu thành lesson cho lần chấm tiếp.
+              Mỗi thay đổi sẽ lưu khi bạn xác nhận điểm.
             </>
           ) : (
-            "Tất cả thay đổi sẽ lưu thành lessons cho lần chấm tiếp."
+            "Nhận xét và điểm sẽ lưu khi bạn xác nhận điểm ở bước cuối."
           )}
         </div>
         <button
           type="button"
           onClick={handleFinish}
-          disabled={!onFinish || feedbackHook.isSubmitting}
+          disabled={!onFinish}
           style={{
             padding: "12px 22px",
             fontSize: 14,
             color: "#fff",
-            background: feedbackHook.isSubmitting ? T.textMute : T.red,
+            background: T.red,
             border: "none",
             borderRadius: 10,
-            cursor:
-              !onFinish || feedbackHook.isSubmitting
-                ? "not-allowed"
-                : "pointer",
+            cursor: !onFinish ? "not-allowed" : "pointer",
             transition: "all 0.2s",
             display: "inline-flex",
             alignItems: "center",
             gap: 6,
             fontWeight: 600,
-            boxShadow: feedbackHook.isSubmitting ? "none" : T.shadowSoft,
+            boxShadow: T.shadowSoft,
             opacity: !onFinish ? 0.5 : 1,
             whiteSpace: "nowrap",
           }}
-          title={
-            feedbackHook.isSubmitting
-              ? "Đang lưu phản hồi HITL…"
-              : "Lưu phản hồi HITL và sang bước Hoàn thành."
-          }
+          title="Sang bước Hoàn thành. Nhận xét HITL sẽ lưu khi bạn xác nhận điểm."
         >
-          {feedbackHook.isSubmitting ? (
-            <>
-              <Icon.RefreshCw size={14} color="#fff" />
-              Đang lưu…
-            </>
-          ) : (
-            <>
-              Hoàn tất bài này
-              <svg
-                width={14}
-                height={14}
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth={2}
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden="true"
-              >
-                <path d="M9 6l6 6-6 6" />
-              </svg>
-            </>
-          )}
+          Hoàn tất bài này
+          <svg
+            width={14}
+            height={14}
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={2}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M9 6l6 6-6 6" />
+          </svg>
         </button>
       </div>
-
-      {/* Feedback POST error — surfaces here (not as a toast) so the
-          teacher sees the failure in the same eyeline as the button they
-          just clicked. Retry works in place; their chat state and score
-          edits are still in component state. */}
-      {feedbackHook.error && (
-        <div
-          style={{
-            marginTop: 12,
-            padding: "10px 14px",
-            background: T.redSoft,
-            border: `1px solid ${T.red}`,
-            borderRadius: 8,
-            fontSize: 13,
-            color: T.red,
-            lineHeight: 1.5,
-            display: "flex",
-            alignItems: "flex-start",
-            gap: 8,
-          }}
-        >
-          <Icon.AlertTriangle size={14} color={T.red} style={{ marginTop: 2 }} />
-          <span>
-            Không lưu được phản hồi HITL: {feedbackHook.error} — bạn thử lại
-            bằng nút "Hoàn tất bài này".
-          </span>
-        </div>
-      )}
 
       <OriginalImageModal
         open={showOriginal}
@@ -797,7 +674,7 @@ function PaperRegrade({
 // Mirrors the helper in StepReview so step 3 highlights and step 4
 // highlights match the same teacher quotes.
 function normalizeForMatch(s: string): string {
-  return s.normalize("NFC").replace(/ /g, " ");
+  return s.normalize("NFC").replace(/\u00A0/g, " ");
 }
 
 // Render a single transcript line with the teacher's step 3 quotes
@@ -1492,4 +1369,3 @@ function ExpandAllToggle({
 // per-câu bounding boxes (Gemini reads the PDF natively but doesn't
 // return coordinates). Header's "Xem PDF gốc" already shows the whole
 // bài làm. Re-add when the prompt + parser learn to emit per-câu regions.
-

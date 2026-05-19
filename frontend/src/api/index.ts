@@ -7,6 +7,7 @@ export type { FeedbackRequest, AnalyzeCommentRequest } from "./feedback";
 export { finalizeGrade } from "./finalize";
 export type { FinalizeGradeRequest } from "./finalize";
 export { sendHeartbeat } from "./heartbeat";
+export { listGradeHistory } from "./history";
 export { detectSubject } from "./detect";
 export type {
   DetectSubjectRequest,

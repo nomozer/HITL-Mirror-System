@@ -8,118 +8,13 @@ import type {
   BackendSubject,
   FeedbackAction,
   GenerateResponse,
+  GradeHistoryEntry,
   Lesson,
   PipelinePhase,
 } from "../types";
 
 // Intentionally generous so the client does not need to mirror backend retry math.
 const PIPELINE_TIMEOUT_MS = 10 * 60 * 1000;
-
-// ── Grade history cache ─────────────────────────────────────────────
-//
-// Every successful pipeline response is appended to a rolling history in
-// localStorage so the teacher can re-enter the Review/Result UI without
-// spending another Gemini call. The header's "Bài đã chấm" dropdown reads
-// from this array; selecting an entry dispatches PIPELINE_SUCCESS with
-// the cached payload and the rest of the app reacts as if a real call
-// returned. Capped at 15 to keep localStorage well under its ~5 MB limit
-// (a typical response is ~5-15 KB without the essay image).
-const HISTORY_STORAGE_KEY = "hitl.gradeHistory";
-// 50 fits a 30-45 student class with a few re-grades and still leaves
-// localStorage well under the 5 MB cap (50 × ~15 KB ≈ 750 KB worst case).
-// Beyond this, search + recency grouping in the dropdown does the
-// findability work — a flat list of 50 was already painful at 15.
-const HISTORY_MAX = 50;
-
-export interface CachedGrade {
-  /** Unique id — uses ``run_id`` from backend when available, falls back to
-   *  the wallclock at cache time. */
-  id: string;
-  /** Cache timestamp (ms since epoch) — used for "x phút trước" labels. */
-  ts: number;
-  /** Task context the grade was generated for. Carries "Môn X · Lớp Y ·
-   *  ĐỀ NAME" prefix from ``buildTaskContext`` so the dropdown can show a
-   *  human-readable row label without re-parsing the response. */
-  task: string;
-  /** Backend subject code (``"cs" | "math" | "phys"``) or null when unknown. */
-  subject: string | null;
-  /** Full response payload — passed straight to PIPELINE_SUCCESS on load. */
-  response: GenerateResponse;
-  /** Teacher's per-câu score overrides from step 4 (câu_num → score).
-   *  Persisted on finalize so re-opening from history shows the score
-   *  the teacher actually locked, not AI's original number. */
-  finalScores?: Record<number, number>;
-  /** Teacher's per-câu max-point overrides — same persistence rationale. */
-  maxOverrides?: Record<number, number>;
-}
-
-function readHistory(): CachedGrade[] {
-  try {
-    const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as CachedGrade[]) : [];
-  } catch {
-    return [];
-  }
-}
-
-function writeHistory(items: CachedGrade[]): void {
-  try {
-    localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(items));
-  } catch {
-    // localStorage full / disabled / private mode — best-effort only.
-  }
-}
-
-export function getCachedGrades(): CachedGrade[] {
-  return readHistory();
-}
-
-export function getCachedGradeById(id: string): CachedGrade | null {
-  return readHistory().find((e) => e.id === id) ?? null;
-}
-
-/** Patch a cache entry's teacher overrides in-place. Called from
- *  EssayWorkspace's onFinalize success path so the history dropdown's
- *  "Xem xét" / "Chấm lại" can restore the teacher's final scores
- *  instead of falling back to AI's. No-op when the entry is gone (e.g.
- *  cleared between finalize attempts). */
-export function updateCachedGradeTeacherData(
-  id: string,
-  finalScores: Record<number, number>,
-  maxOverrides: Record<number, number>,
-): void {
-  const items = readHistory();
-  const idx = items.findIndex((e) => e.id === id);
-  if (idx === -1) return;
-  items[idx] = { ...items[idx], finalScores, maxOverrides };
-  writeHistory(items);
-}
-
-export function clearCachedGrades(): void {
-  try {
-    localStorage.removeItem(HISTORY_STORAGE_KEY);
-  } catch {
-    // best-effort
-  }
-}
-
-function appendToHistory(meta: { task: string; subject: string | null }, data: GenerateResponse): void {
-  const id = data.run_id != null ? String(data.run_id) : `ts-${Date.now()}`;
-  const entry: CachedGrade = {
-    id,
-    ts: Date.now(),
-    task: meta.task,
-    subject: meta.subject,
-    response: data,
-  };
-  // Dedupe by id (a regrade reusing the same run_id should overwrite, not
-  // pile up). Newest first, oldest trimmed off the tail.
-  const existing = readHistory().filter((e) => e.id !== id);
-  const next = [entry, ...existing].slice(0, HISTORY_MAX);
-  writeHistory(next);
-}
 
 // ── State & actions ─────────────────────────────────────────────────
 
@@ -132,7 +27,11 @@ const ACTIONS = {
 
 type Action =
   | { type: typeof ACTIONS.PIPELINE_START }
-  | { type: typeof ACTIONS.PIPELINE_SUCCESS; payload: GenerateResponse }
+  | {
+      type: typeof ACTIONS.PIPELINE_SUCCESS;
+      payload: GenerateResponse;
+      historyEntry?: GradeHistoryEntry | null;
+    }
   | { type: typeof ACTIONS.PIPELINE_ERROR; payload: string }
   | { type: typeof ACTIONS.RESET };
 
@@ -145,6 +44,8 @@ interface State {
   newLessonIds: number[];
   runId: number | null;
   error: string | null;
+  historyFinalScores: Record<number, number> | null;
+  historyMaxOverrides: Record<number, number> | null;
 }
 
 const initialState: State = {
@@ -158,6 +59,8 @@ const initialState: State = {
   newLessonIds: [],
   runId: null,
   error: null,
+  historyFinalScores: null,
+  historyMaxOverrides: null,
 };
 
 function reducer(state: State, action: Action): State {
@@ -175,6 +78,8 @@ function reducer(state: State, action: Action): State {
         runId: null,
         error: null,
         previousLessonIds: state.lessonsUsed.map((l) => l.id),
+        historyFinalScores: null,
+        historyMaxOverrides: null,
       };
 
     case ACTIONS.PIPELINE_SUCCESS: {
@@ -190,6 +95,8 @@ function reducer(state: State, action: Action): State {
         newLessonIds,
         runId: action.payload.run_id,
         error: null,
+        historyFinalScores: action.historyEntry?.finalScores ?? null,
+        historyMaxOverrides: action.historyEntry?.maxOverrides ?? null,
       };
     }
 
@@ -231,11 +138,10 @@ export interface UseAgentPipelineResult extends State {
   regrade: (input: RegradeInput) => Promise<void>;
   reset: () => void;
   /**
-   * Hydrate pipeline state from a cached grade by id — no network call.
-   * Returns true if the id was found in history and loaded. Used by the
+   * Hydrate pipeline state from a backend history entry. Used by the
    * "Bài đã chấm" header dropdown.
    */
-  loadCachedById: (id: string) => boolean;
+  loadHistoryEntry: (entry: GradeHistoryEntry) => boolean;
 }
 
 /**
@@ -326,7 +232,6 @@ export function useAgentPipeline(): UseAgentPipelineResult {
         );
         if (requestIdRef.current !== requestId) return;
         releaseIfCurrent();
-        appendToHistory({ task, subject }, data);
         dispatch({ type: ACTIONS.PIPELINE_SUCCESS, payload: data });
       } catch (err) {
         if (requestIdRef.current !== requestId) return;
@@ -370,7 +275,6 @@ export function useAgentPipeline(): UseAgentPipelineResult {
         );
         if (requestIdRef.current !== requestId) return;
         releaseIfCurrent();
-        appendToHistory({ task, subject }, data);
         dispatch({ type: ACTIONS.PIPELINE_SUCCESS, payload: data });
       } catch (err) {
         if (requestIdRef.current !== requestId) return;
@@ -381,15 +285,18 @@ export function useAgentPipeline(): UseAgentPipelineResult {
     [beginRequest],
   );
 
-  const loadCachedById = useCallback(
-    (id: string): boolean => {
-      const entry = readHistory().find((e) => e.id === id);
+  const loadHistoryEntry = useCallback(
+    (entry: GradeHistoryEntry): boolean => {
       if (!entry || typeof entry.response?.code !== "string") return false;
       // Cancel any in-flight call so its eventual response can't overwrite
-      // the cached state we're about to install.
+      // the history state we're about to install.
       requestIdRef.current += 1;
       clearInFlight();
-      dispatch({ type: ACTIONS.PIPELINE_SUCCESS, payload: entry.response });
+      dispatch({
+        type: ACTIONS.PIPELINE_SUCCESS,
+        payload: entry.response,
+        historyEntry: entry,
+      });
       return true;
     },
     [clearInFlight],
@@ -409,5 +316,5 @@ export function useAgentPipeline(): UseAgentPipelineResult {
     [clearInFlight],
   );
 
-  return { ...state, generate, regrade, reset, loadCachedById };
+  return { ...state, generate, regrade, reset, loadHistoryEntry };
 }

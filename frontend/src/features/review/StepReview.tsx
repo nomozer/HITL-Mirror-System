@@ -1287,6 +1287,7 @@ function AnnotatedAnswer({
         onUpdateAnnotation(id, {
           verdict: (data.verdict as CommentVerdict) || "agree",
           analysis: (data.analysis || "").trim(),
+          lesson: (data.lesson || "").trim(),
         });
       } catch (err) {
         console.warn("[step3] analyze-comment failed:", err);
@@ -1554,6 +1555,7 @@ function AnnotatedAnswer({
               comment: trimmed,
               verdict: undefined,
               analysis: undefined,
+              lesson: undefined,
               disputeDecision: undefined,
             });
             setEditingId(null);

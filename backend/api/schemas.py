@@ -179,11 +179,20 @@ class FinalizeGradeRequest(BaseModel):
     approved_grade_json: str = Field(default="")
     run_id: int | None = None
     subject: str | None = None
+    comment: str = Field(
+        default="",
+        description="Optional aggregate teacher comments saved with the final grade.",
+    )
+    staged_lessons: list[StagedLesson] = Field(
+        default_factory=list,
+        description="Per-question lessons staged during review; saved atomically with finalize.",
+    )
 
 
 class FinalizeGradeResponse(BaseModel):
     approved_id: int | None = None
     delta_lesson_id: int | None = None
+    comment_lesson_ids: list[int] = Field(default_factory=list)
     deltas: dict[str, float] = Field(default_factory=dict)
     message: str
 

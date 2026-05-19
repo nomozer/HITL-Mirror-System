@@ -1,10 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { T } from "../../theme/tokens";
-import {
-  type CachedGrade,
-  clearCachedGrades,
-  getCachedGrades,
-} from "../../hooks/useAgentPipeline";
+import { ApiError, listGradeHistory } from "../../api";
+import type { GradeHistoryEntry } from "../../types";
 
 interface GradeHistoryDropdownProps {
   open: boolean;
@@ -43,7 +40,7 @@ function relativeTime(ts: number): string {
 }
 
 // Decode the task-context string that ``buildTaskContext`` produces and
-// any legacy variants still present in the localStorage cache:
+// any legacy variants still present in stored history:
 //
 //   current  : "<Môn X> · <tên đề>"                  (no class)
 //   current  : "<Môn X>" / ""                        (subject only / empty)
@@ -54,7 +51,7 @@ function relativeTime(ts: number): string {
 //   classLabel = "Lớp 10" / "" — only populated by legacy entries; the
 //                current header has no class pill so new entries always
 //                return "". The dropdown still renders the label when
-//                present so the teacher's older cached grades don't
+//                present so the teacher's older stored grades don't
 //                lose their visual breadcrumb.
 //
 // Subject itself is read from entry.subject (the backend code), so the
@@ -77,8 +74,8 @@ function parseTaskContext(task: string): { body: string; classLabel: string } {
 // Recency buckets so a 30-50 row list still gives the teacher a temporal
 // anchor without a real timeline. Comparing day-boundaries (not wall
 // clock) so "chấm lúc 23:55 hôm qua" sits in "Hôm qua" even when read
-// at 00:05 today. ``getCachedGrades`` already returns newest-first, so
-// each bucket inherits that ordering.
+// at 00:05 today. Backend history already returns newest-first, so each
+// bucket inherits that ordering.
 type Bucket = "today" | "yesterday" | "week" | "older";
 
 const BUCKET_LABEL: Record<Bucket, string> = {
@@ -104,17 +101,32 @@ function bucketOf(ts: number): Bucket {
 }
 
 export function GradeHistoryDropdown({ open, onClose, anchorRect }: GradeHistoryDropdownProps) {
-  // Re-read on each open so a freshly-saved grade appears without remounting.
-  // Closed dropdowns don't pay the cost.
-  const [entries, setEntries] = useState<CachedGrade[]>([]);
+  // Re-read from backend on each open so a freshly-saved grade appears
+  // without relying on browser-local history.
+  const [entries, setEntries] = useState<GradeHistoryEntry[]>([]);
   const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
-    if (open) {
-      setEntries(getCachedGrades());
-      // Reset query when re-opening so the previous filter doesn't ghost
-      // through (teacher's mental model: opening fresh = see everything).
-      setQuery("");
-    }
+    if (!open) return;
+    const ctrl = new AbortController();
+    setLoading(true);
+    setError(null);
+    // Reset query when re-opening so the previous filter doesn't ghost
+    // through (teacher's mental model: opening fresh = see everything).
+    setQuery("");
+    listGradeHistory({ limit: 50 }, { signal: ctrl.signal })
+      .then((res) => setEntries(res.items))
+      .catch((err) => {
+        if ((err as Error).name === "AbortError") return;
+        const msg = err instanceof ApiError ? err.detail : (err as Error).message;
+        setError(msg || "Không tải được lịch sử bài chấm.");
+        setEntries([]);
+      })
+      .finally(() => {
+        if (!ctrl.signal.aborted) setLoading(false);
+      });
+    return () => ctrl.abort();
   }, [open]);
 
   // ESC closes — same UX as Memory / Help modals.
@@ -139,7 +151,7 @@ export function GradeHistoryDropdown({ open, onClose, anchorRect }: GradeHistory
           return body.toLowerCase().includes(q) || subj.includes(q);
         })
       : entries;
-    const out: Record<Bucket, CachedGrade[]> = {
+    const out: Record<Bucket, GradeHistoryEntry[]> = {
       today: [],
       yesterday: [],
       week: [],
@@ -154,27 +166,20 @@ export function GradeHistoryDropdown({ open, onClose, anchorRect }: GradeHistory
   const totalVisible = groups.today.length + groups.yesterday.length + groups.week.length + groups.older.length;
 
   const handleLoad = useCallback(
-    (id: string, step: 3 | 4 | 5 = 3) => {
+    (entry: GradeHistoryEntry, step: 3 | 4 | 5 = 3) => {
       // Hand off to the active tab's EssayWorkspace via a window event. The
       // dropdown lives in the header and has no direct ref into the tab,
       // and the active tab listens for this exact event. Carrying ``step``
-      // lets one cached grade enter at any of the three teacher-facing
+      // lets one history grade enter at any of the three teacher-facing
       // surfaces (Review / Regrade / Done) — Review is the default since
       // that's where you usually want to start a re-pass.
       window.dispatchEvent(
-        new CustomEvent("hitl.loadGrade", { detail: { id, step } }),
+        new CustomEvent("hitl.loadGrade", { detail: { entry, step } }),
       );
       onClose();
     },
     [onClose],
   );
-
-  const handleClearAll = useCallback(() => {
-    if (entries.length === 0) return;
-    if (!window.confirm(`Xoá toàn bộ ${entries.length} bài chấm khỏi lịch sử trình duyệt?`)) return;
-    clearCachedGrades();
-    setEntries([]);
-  }, [entries.length]);
 
   // Anchor under the trigger button's right edge so the popover hangs
   // beneath the link rather than centering on the page.
@@ -244,28 +249,10 @@ export function GradeHistoryDropdown({ open, onClose, anchorRect }: GradeHistory
           >
             Bài đã chấm
           </div>
-          {entries.length > 0 && (
-            <button
-              type="button"
-              onClick={handleClearAll}
-              style={{
-                background: "transparent",
-                border: "none",
-                color: T.textFaint,
-                fontSize: T.fontSize.xs,
-                fontFamily: T.font,
-                cursor: "pointer",
-                padding: 4,
-              }}
-              title="Xoá toàn bộ lịch sử trình duyệt"
-            >
-              Xoá tất cả
-            </button>
-          )}
         </div>
 
         {/* Search box — only shown once there's at least one entry. Hidden
-            on a fresh empty cache to keep the "Chưa có bài" empty state
+            on a fresh empty history to keep the "Chưa có bài" empty state
             as the primary content. */}
         {entries.length > 0 && (
           <div
@@ -298,7 +285,30 @@ export function GradeHistoryDropdown({ open, onClose, anchorRect }: GradeHistory
 
         {/* Body — scrollable list grouped by recency bucket */}
         <div style={{ overflowY: "auto", flex: 1 }}>
-          {entries.length === 0 ? (
+          {loading ? (
+            <div
+              style={{
+                padding: `${T.space[8]}px ${T.space[5]}px`,
+                textAlign: "center",
+                color: T.textMute,
+                fontSize: T.fontSize.sm,
+              }}
+            >
+              Đang tải lịch sử…
+            </div>
+          ) : error ? (
+            <div
+              style={{
+                padding: `${T.space[8]}px ${T.space[5]}px`,
+                textAlign: "center",
+                color: T.red,
+                fontSize: T.fontSize.sm,
+                lineHeight: 1.6,
+              }}
+            >
+              {error}
+            </div>
+          ) : entries.length === 0 ? (
             <div
               style={{
                 padding: `${T.space[8]}px ${T.space[5]}px`,
@@ -310,7 +320,7 @@ export function GradeHistoryDropdown({ open, onClose, anchorRect }: GradeHistory
             >
               Chưa có bài chấm nào trong lịch sử.
               <div style={{ marginTop: T.space[2], fontSize: T.fontSize.xs, color: T.textFaint }}>
-                Mỗi lần chấm thành công sẽ tự lưu vào đây (tối đa 50 bài gần nhất).
+                Mỗi lần chấm thành công sẽ tự lưu vào backend (tối đa 50 bài gần nhất).
               </div>
             </div>
           ) : totalVisible === 0 ? (
@@ -351,7 +361,7 @@ export function GradeHistoryDropdown({ open, onClose, anchorRect }: GradeHistory
                     <HistoryRow
                       key={entry.id}
                       entry={entry}
-                      onLoad={(step) => handleLoad(entry.id, step)}
+                      onLoad={(step) => handleLoad(entry, step)}
                     />
                   ))}
                 </section>
@@ -360,7 +370,7 @@ export function GradeHistoryDropdown({ open, onClose, anchorRect }: GradeHistory
           )}
         </div>
 
-        {/* Footer caption — hint about cache scope */}
+        {/* Footer caption — hint about persistence scope */}
         {entries.length > 0 && (
           <div
             style={{
@@ -371,7 +381,7 @@ export function GradeHistoryDropdown({ open, onClose, anchorRect }: GradeHistory
               textAlign: "center",
             }}
           >
-            Lưu cục bộ trong trình duyệt · Không gọi API
+            Lấy từ backend/database · Không phụ thuộc cache trình duyệt
           </div>
         )}
       </div>
@@ -396,7 +406,7 @@ function HistoryRow({
   entry,
   onLoad,
 }: {
-  entry: CachedGrade;
+  entry: GradeHistoryEntry;
   onLoad: (step: 3 | 4 | 5) => void;
 }) {
   const [hovered, setHovered] = useState(false);
